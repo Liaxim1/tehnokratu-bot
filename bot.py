@@ -20,7 +20,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-POST_HOUR = int(os.getenv("POST_HOUR", "9"))
+POST_HOUR = int(os.getenv("POST_HOUR", "10"))
 POST_MINUTE = int(os.getenv("POST_MINUTE", "0"))
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
@@ -140,7 +140,7 @@ async def generate_review(editor_note: str = "") -> str:
         instruction += f"\n\nРедакторська вказівка для доопрацювання: {editor_note}"
     response = await client.responses.create(
         model=MODEL,
-        tools=[{"type": "web_search_preview"}],
+        tools=[{"type": "web_search"}],
         input=SYSTEM_PROMPT + "\n\n" + instruction,
     )
     return response.output_text.strip()
@@ -337,7 +337,7 @@ def main():
     app.job_queue.run_daily(
         scheduled_post,
         time(hour=POST_HOUR, minute=POST_MINUTE, tzinfo=TZ),
-        days=(5,),
+        days=(6,),
         name="weekly_world_review",
     )
     logger.info("Bot started; weekly draft on Saturday at %02d:%02d %s", POST_HOUR, POST_MINUTE, TZ.key)
