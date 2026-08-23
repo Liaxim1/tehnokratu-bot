@@ -49,6 +49,46 @@ async def generate_review(editor_note: str = "") -> str:
 
 
 PENDING_DRAFT: dict[int, str] = {}
+FAVORITES_FILE = os.getenv("FAVORITES_FILE", "favorites.json")
+FAVORITES: dict[int, list[dict[str, str]]] = {}
+
+def load_favorites():
+    global FAVORITES
+    try:
+        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        FAVORITES = {int(k): v for k, v in raw.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        FAVORITES = {}
+
+def save_favorites():
+    tmp = FAVORITES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(FAVORITES, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, FAVORITES_FILE)
+
+def add_favorite(user_id: int, text: str) -> int:
+    items = FAVORITES.setdefault(user_id, [])
+    # Avoid exact duplicates.
+    for i, item in enumerate(items, 1):
+        if item.get("text") == text:
+            return i
+    import datetime as _dt
+    items.append({
+        "text": text,
+        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()
+    })
+    save_favorites()
+    return len(items)
+
+def remove_favorite(user_id: int, index: int):
+    items = FAVORITES.get(user_id, [])
+    if 1 <= index <= len(items):
+        items.pop(index - 1)
+        save_favorites()
+
+load_favorites()
+
 
 
 async def generate_answer(question: str) -> str:
@@ -97,129 +137,156 @@ async def revise_draft(draft: str, instruction: str) -> str:
 
 
 
-def approval_keyboard():
+def approval_keyboard(collapsed: bool = True, favorite: bool = False):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Підтвердити і відправити", callback_data="approve")],
+        [InlineKeyboardButton(
+            "🔽 Розгорнути" if collapsed else "🔼 Згорнути",
+            callback_data="expand" if collapsed else "collapse"
+        )],
+        [InlineKeyboardButton(
+            "⭐ Прибрати з обраного" if favorite else "⭐ Додати в обране",
+            callback_data="unfavorite" if favorite else "favorite"
+        )],
         [InlineKeyboardButton("✏️ Внести правки", callback_data="revise"),
          InlineKeyboardButton("📝 Ввести свій текст", callback_data="edit")],
+        [InlineKeyboardButton("✅ Підтвердити і відправити", callback_data="approve")],
     ])
 
+async def show_draft(update_or_message, context, text: str, collapsed: bool = True):
+    user_id = update_or_message.from_user.id if hasattr(update_or_message, "from_user") and update_or_message.from_user else update_or_message.chat_id
+    is_fav = any(item.get("text") == text for item in FAVORITES.get(user_id, []))
+    markup = approval_keyboard(collapsed=collapsed, favorite=is_fav)
+    target_chat = str(user_id)
+    await send_long_message(context.bot, target_chat, text, markup, collapse=collapsed)
 
-def markdown_to_rich_html(text: str) -> str:
-    """Convert the model's Markdown into safe Telegram Rich Message HTML."""
+
+
+def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
+    """Convert Markdown to Telegram Rich Message HTML.
+    If collapse=True, keep the title and first short paragraph visible and put
+    the remaining article into an expandable blockquote.
+    """
     import re
     import html as _html
 
-    # If the model already returned HTML, keep it as-is.
     if re.search(r"<h[1-6][^>]*>|<p[^>]*>|<table[^>]*>", text, re.I):
-        return text
+        html_text = text
+    else:
+        lines = text.replace("\r\n", "\n").split("\n")
+        out = []
+        in_ul = False
+        in_ol = False
+        in_quote = False
+        i = 0
 
-    lines = text.replace("\r\n", "\n").split("\n")
-    out = []
-    in_ul = False
-    in_ol = False
-    in_quote = False
-    i = 0
+        def inline(s: str) -> str:
+            s = _html.escape(s, quote=False)
+            s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+            s = re.sub(r'(?<!["=])(https?://[^\s<]+)', r'<a href="\1">\1</a>', s)
+            s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+            s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+            s = re.sub(r"__([^_]+)__", r"<b>\1</b>", s)
+            s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", s)
+            s = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", s)
+            return s
 
-    def inline(s: str) -> str:
-        s = _html.escape(s, quote=False)
-        # Markdown links first.
-        s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
-        # Bare URLs.
-        s = re.sub(r'(?<![\"=])(https?://[^\s<]+)', r'<a href="\1">\1</a>', s)
-        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
-        s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
-        s = re.sub(r"__([^_]+)__", r"<b>\1</b>", s)
-        s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", s)
-        s = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", s)
-        return s
+        def close_lists():
+            nonlocal in_ul, in_ol
+            if in_ul:
+                out.append("</ul>"); in_ul = False
+            if in_ol:
+                out.append("</ol>"); in_ol = False
 
-    def close_lists():
-        nonlocal in_ul, in_ol
-        if in_ul:
-            out.append("</ul>")
-            in_ul = False
-        if in_ol:
-            out.append("</ol>")
-            in_ol = False
+        def close_quote():
+            nonlocal in_quote
+            if in_quote:
+                out.append("</blockquote>"); in_quote = False
 
-    def close_quote():
-        nonlocal in_quote
-        if in_quote:
-            out.append("</blockquote>")
-            in_quote = False
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                close_lists(); close_quote(); i += 1; continue
 
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
+            if i + 1 < len(lines) and "|" in line and re.match(
+                r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$",
+                lines[i+1]
+            ):
+                close_lists(); close_quote()
+                def cells(x):
+                    return [c.strip() for c in x.strip().strip("|").split("|")]
+                headers = cells(line)
+                out.append("<table><thead><tr>" + "".join(
+                    f"<th>{inline(c)}</th>" for c in headers
+                ) + "</tr></thead><tbody>")
+                i += 2
+                while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                    row = cells(lines[i])
+                    out.append("<tr>" + "".join(
+                        f"<td>{inline(c)}</td>" for c in row
+                    ) + "</tr>")
+                    i += 1
+                out.append("</tbody></table>")
+                continue
 
-        if not stripped:
-            close_lists(); close_quote(); i += 1; continue
+            m = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+            if m:
+                close_lists(); close_quote()
+                level = min(len(m.group(1)), 4)
+                out.append(f"<h{level}>{inline(m.group(2))}</h{level}>")
+                i += 1; continue
 
-        # Markdown table.
-        if i + 1 < len(lines) and "|" in line and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", lines[i+1]):
+            if re.match(r"^\s*(---+|___+|\*\s*\*\s*\*+)\s*$", line):
+                close_lists(); close_quote(); out.append("<hr/>"); i += 1; continue
+
+            m = re.match(r"^\s*[-*+]\s+(.+)$", line)
+            if m:
+                close_quote()
+                if not in_ul:
+                    if in_ol: out.append("</ol>"); in_ol = False
+                    out.append("<ul>"); in_ul = True
+                out.append(f"<li>{inline(m.group(1))}</li>")
+                i += 1; continue
+
+            m = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
+            if m:
+                close_quote()
+                if not in_ol:
+                    if in_ul: out.append("</ul>"); in_ul = False
+                    out.append("<ol>"); in_ol = True
+                out.append(f"<li>{inline(m.group(1))}</li>")
+                i += 1; continue
+
+            m = re.match(r"^\s*>\s?(.*)$", line)
+            if m:
+                close_lists()
+                if not in_quote:
+                    out.append("<blockquote>"); in_quote = True
+                out.append(inline(m.group(1)) + "<br/>")
+                i += 1; continue
+
             close_lists(); close_quote()
-            def cells(x):
-                x=x.strip().strip("|")
-                return [c.strip() for c in x.split("|")]
-            headers=cells(line)
-            out.append("<table><thead><tr>" + "".join(f"<th>{inline(c)}</th>" for c in headers) + "</tr></thead><tbody>")
-            i += 2
-            while i < len(lines) and "|" in lines[i] and lines[i].strip():
-                row=cells(lines[i])
-                out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in row) + "</tr>")
-                i += 1
-            out.append("</tbody></table>")
-            continue
-
-        m = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
-        if m:
-            close_lists(); close_quote()
-            level=min(len(m.group(1)), 4)
-            out.append(f"<h{level}>{inline(m.group(2))}</h{level}>")
-            i += 1; continue
-
-        if re.match(r"^\s*(---+|___+|\*\s*\*\s*\*+)\s*$", line):
-            close_lists(); close_quote(); out.append("<hr/>"); i += 1; continue
-
-        m = re.match(r"^\s*[-*+]\s+(.+)$", line)
-        if m:
-            close_quote()
-            if not in_ul:
-                if in_ol: out.append("</ol>"); in_ol=False
-                out.append("<ul>"); in_ul=True
-            out.append(f"<li>{inline(m.group(1))}</li>")
-            i += 1; continue
-
-        m = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
-        if m:
-            close_quote()
-            if not in_ol:
-                if in_ul: out.append("</ul>"); in_ul=False
-                out.append("<ol>"); in_ol=True
-            out.append(f"<li>{inline(m.group(1))}</li>")
-            i += 1; continue
-
-        m = re.match(r"^\s*>\s?(.*)$", line)
-        if m:
-            close_lists()
-            if not in_quote:
-                out.append("<blockquote>"); in_quote=True
-            out.append(inline(m.group(1)) + "<br/>")
-            i += 1; continue
+            out.append(f"<p>{inline(stripped)}</p>")
+            i += 1
 
         close_lists(); close_quote()
-        out.append(f"<p>{inline(stripped)}</p>")
-        i += 1
+        html_text = "".join(out)
 
-    close_lists(); close_quote()
-    return "".join(out)
+    if collapse:
+        # Keep first heading + disclaimer + first short paragraph visible.
+        parts = re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>", html_text, re.I | re.S)
+        if len(parts) > 3:
+            visible = "".join(parts[:3])
+            rest = html_text[len(visible):]
+            return visible + f'<blockquote expandable>{rest}</blockquote>'
+    return html_text
 
 
-async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None) -> None:
-    """Send Telegram Rich Message using the Bot API 10.1+ sendRichMessage method."""
-    html_text = markdown_to_rich_html(html_text)
+
+async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None, collapse: bool = False) -> None:
+    """Send Telegram Rich Message; long content can be expandable."""
+    html_text = markdown_to_rich_html(html_text, collapse=collapse)
     token = bot.token
     url = f"https://api.telegram.org/bot{token}/sendRichMessage"
     payload = {
@@ -233,6 +300,7 @@ async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_marku
         response = await client_http.post(url, json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"Telegram sendRichMessage failed: {response.text}")
+
 
 
 async def send_plain_fallback(bot, chat_id: str | int, text: str, reply_markup=None) -> None:
@@ -249,19 +317,16 @@ async def send_plain_fallback(bot, chat_id: str | int, text: str, reply_markup=N
     )
 
 
-async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=None) -> None:
-    # Rich Messages support up to 32768 UTF-8 characters. Keep a safety margin.
+async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=None, collapse: bool = False) -> None:
     if len(text) <= 30000:
         try:
-            await send_rich_message(bot, chat_id, text, reply_markup)
+            await send_rich_message(bot, chat_id, text, reply_markup, collapse=collapse)
             return
         except Exception:
             logger.exception("Rich message failed; using plain fallback")
             await send_plain_fallback(bot, chat_id, text, reply_markup)
             return
 
-    # Oversized articles are split at paragraph boundaries. The preferred target is to
-    # stay well below Telegram's rich-message limit.
     chunks = []
     remaining = text
     while len(remaining) > 30000:
@@ -280,10 +345,14 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
     for i, chunk in enumerate(chunks):
         markup = reply_markup if i == len(chunks) - 1 else None
         try:
-            await send_rich_message(bot, chat_id, chunk, markup)
+            await send_rich_message(
+                bot, chat_id, chunk, markup,
+                collapse=collapse if i == 0 else False
+            )
         except Exception:
             logger.exception("Rich chunk failed; using plain fallback")
             await send_plain_fallback(bot, chat_id, chunk, markup)
+
 
 
 async def deliver_to_group(bot, text: str):
@@ -299,7 +368,7 @@ async def deliver_to_group(bot, text: str):
         else:
             # Fallback if the model did not produce an HTML heading.
             text = disclaimer + text
-    await send_long_message(bot, CHANNEL_ID, text)
+    await send_long_message(bot, CHANNEL_ID, text, collapse=True)
 
 
 
@@ -345,13 +414,27 @@ async def done_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("manual_parts", None)
 
     await update.message.reply_text("Готово. Ваш текст встановлено як нову чернетку. Перевірте його:")
-    await send_long_message(
-        context.bot,
-        str(user_id),
-        draft,
-        approval_keyboard(),
-    )
+    await show_draft(update, context, draft, collapsed=True)
 
+
+
+async def favorites_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    items = FAVORITES.get(update.effective_user.id, [])
+    if not items:
+        await update.message.reply_text("⭐ «Обране» поки порожнє.")
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    for idx, item in enumerate(items, 1):
+        title = re.sub(r"<[^>]+>", "", item.get("text", "")).strip().split("\n")[0]
+        title = title[:55] if title else f"Матеріал {idx}"
+        rows.append([InlineKeyboardButton(f"⭐ {idx}. {title}", callback_data=f"favview:{idx}")])
+    await update.message.reply_text(
+        "⭐ Ваше «Обране»:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,12 +468,7 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         answer = await generate_answer(question)
         PENDING_DRAFT[update.effective_user.id] = answer
-        await send_long_message(
-            context.bot,
-            str(update.effective_user.id),
-            answer,
-            approval_keyboard(),
-        )
+        await show_draft(update, context, answer, collapsed=True)
         await update.message.reply_text(
             "Це чернетка аналізу. Можна підтвердити публікацію, внести правки запитом, "
             "повністю замінити текст вручну."
@@ -409,7 +487,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/post — створити статтю для погодження\n"
         "/preview — створити статтю без автоматичної публікації\n"
         "/ask [питання] — окремий аналіз будь-якого питання\n"
-        "/done — завершити ручне введення статті\n/cancel — скасувати поточну чернетку\n"
+        "/done — завершити ручне введення статті\n/cancel — скасувати поточну чернетку\n/favorites — моє «Обране»\n"
         "/help — довідка\n\n"
         "Щосуботи о 10:00 я автоматично готую статтю та надсилаю її вам на перевірку. "
         "У групу вона потрапляє лише після вашого підтвердження.\n\n"
@@ -426,19 +504,51 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not query.from_user or query.from_user.id != ADMIN_ID:
         return
-
-    chat_id = query.from_user.id
-    draft = PENDING_DRAFT.get(chat_id)
+    user_id = query.from_user.id
+    draft = PENDING_DRAFT.get(user_id)
     if not draft:
-        await query.message.reply_text(
-            "Чернетка вже відсутня або була оброблена. Створіть нову через /preview або /ask."
-        )
+        await query.message.reply_text("Чернетка вже відсутня або була оброблена. Створіть нову через /preview або /ask.")
+        return
+
+    if query.data in ("expand", "collapse"):
+        collapsed = query.data == "collapse"
+        await show_draft(query, context, draft, collapsed=collapsed)
+        return
+
+    if query.data == "favorite":
+        add_favorite(user_id, draft)
+        await query.message.reply_text("⭐ Матеріал додано до «Обраного». Для перегляду використовуйте /favorites.")
+        await show_draft(query, context, draft, collapsed=True)
+        return
+
+    if query.data == "unfavorite":
+        items = FAVORITES.get(user_id, [])
+        for idx, item in enumerate(items, 1):
+            if item.get("text") == draft:
+                remove_favorite(user_id, idx)
+                break
+        await query.message.reply_text("Матеріал прибрано з «Обраного».")
+        await show_draft(query, context, draft, collapsed=True)
+        return
+
+    if query.data.startswith("favview:"):
+        try:
+            idx = int(query.data.split(":", 1)[1])
+            items = FAVORITES.get(user_id, [])
+            if not (1 <= idx <= len(items)):
+                await query.message.reply_text("Цей матеріал більше не знайдено в «Обраному».")
+                return
+            fav_text = items[idx - 1].get("text", "")
+            PENDING_DRAFT[user_id] = fav_text
+            await show_draft(query, context, fav_text, collapsed=True)
+        except (ValueError, IndexError):
+            await query.message.reply_text("Не вдалося відкрити цей матеріал.")
         return
 
     if query.data == "approve":
         try:
             await deliver_to_group(context.bot, draft)
-            PENDING_DRAFT.pop(chat_id, None)
+            PENDING_DRAFT.pop(user_id, None)
             context.user_data.pop("revision_edit", None)
             context.user_data.pop("manual_edit", None)
             context.user_data.pop("manual_parts", None)
@@ -446,26 +556,26 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             logger.exception("Publication failed")
             await query.message.reply_text(f"Не вдалося опублікувати: {type(exc).__name__}: {exc}")
+        return
 
-    elif query.data == "revise":
+    if query.data == "revise":
         context.user_data["revision_edit"] = True
         context.user_data.pop("manual_edit", None)
         context.user_data.pop("manual_parts", None)
         await query.message.reply_text(
-            "Напишіть одним повідомленням, що саме потрібно змінити. "
-            "Наприклад: «Скороти вступ удвічі, додай більше даних про Європу "
-            "і зроби висновок гострішим». Я перероблю поточну версію та знову покажу її на погодження."
+            "Напишіть одним повідомленням, що саме потрібно змінити. Я перероблю поточну версію."
         )
+        return
 
-    elif query.data == "edit":
+    if query.data == "edit":
         context.user_data["manual_edit"] = True
         context.user_data["manual_parts"] = []
         context.user_data.pop("revision_edit", None)
         await query.message.reply_text(
             "Надішліть свій готовий текст замість цієї чернетки. "
-            "Можна одним повідомленням або кількома частинами. "
-            "Після останньої частини надішліть /done."
+            "Можна одним повідомленням або кількома частинами. Після останньої частини надішліть /done."
         )
+
 
 
 
@@ -555,6 +665,7 @@ def main():
     app.add_handler(CommandHandler("preview", preview))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("favorites", favorites_cmd))
     app.add_handler(CommandHandler("done", done_edit))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
