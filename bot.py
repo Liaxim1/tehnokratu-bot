@@ -49,6 +49,7 @@ async def generate_review(editor_note: str = "") -> str:
 
 
 PENDING_DRAFT: dict[int, str] = {}
+DRAFT_MESSAGE_IDS: dict[int, list[int]] = {}  # current preview messages per admin
 FAVORITES_FILE = os.getenv("FAVORITES_FILE", "favorites.json")
 FAVORITES: dict[int, list[dict[str, str]]] = {}
 
@@ -153,22 +154,57 @@ def approval_keyboard(collapsed: bool = True, favorite: bool = False):
         [InlineKeyboardButton("✅ Підтвердити і відправити", callback_data="approve")],
     ])
 
-async def show_draft(update_or_message, context, text: str, collapsed: bool = True):
+async def clear_draft_messages(bot, user_id: int):
+    """Remove only the messages used by the current draft preview."""
+    ids = DRAFT_MESSAGE_IDS.pop(user_id, [])
+    if not ids:
+        return
+    token = bot.token
+    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+    async with httpx.AsyncClient(timeout=30) as client_http:
+        for mid in ids:
+            try:
+                r = await client_http.post(url, json={"chat_id": user_id, "message_id": mid})
+                if r.status_code != 200:
+                    logger.warning("Could not delete draft message %s: %s", mid, r.text)
+            except Exception:
+                logger.exception("Failed to delete draft message %s", mid)
+
+async def show_draft(update_or_message, context, text: str, collapsed: bool = True, replace_previous: bool = True):
     user_id = update_or_message.from_user.id if hasattr(update_or_message, "from_user") and update_or_message.from_user else update_or_message.chat_id
+    if replace_previous:
+        await clear_draft_messages(context.bot, user_id)
     is_fav = any(item.get("text") == text for item in FAVORITES.get(user_id, []))
     markup = approval_keyboard(collapsed=collapsed, favorite=is_fav)
-    target_chat = str(user_id)
-    await send_long_message(context.bot, target_chat, text, markup, collapse=collapsed)
+    ids = await send_long_message(context.bot, str(user_id), text, markup, collapse=collapsed)
+    DRAFT_MESSAGE_IDS[user_id] = ids
+
 
 
 
 def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
     """Convert Markdown to Telegram Rich Message HTML.
-    If collapse=True, keep the title and first short paragraph visible and put
-    the remaining article into an expandable blockquote.
+    Administrator text is marked with [[ADMIN]]...[[/ADMIN]] or [[ADMIN: ...]]
+    and rendered in a visibly different italic style with a fixed label.
     """
     import re
     import html as _html
+
+    # Protect administrator blocks before normal Markdown processing.
+    admin_blocks = []
+
+    def protect_admin(match):
+        content = (match.group(1) if match.group(1) is not None else match.group(2)).strip()
+        token = f"__ADMIN_BLOCK_{len(admin_blocks)}__"
+        admin_blocks.append(content)
+        return token
+
+    text = re.sub(
+        r"\[\[ADMIN\]\](.*?)\[\[/ADMIN\]\]|\[\[ADMIN:\s*(.*?)\]\]",
+        protect_admin,
+        text,
+        flags=re.I | re.S,
+    )
 
     if re.search(r"<h[1-6][^>]*>|<p[^>]*>|<table[^>]*>", text, re.I):
         html_text = text
@@ -223,9 +259,7 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                 i += 2
                 while i < len(lines) and "|" in lines[i] and lines[i].strip():
                     row = cells(lines[i])
-                    out.append("<tr>" + "".join(
-                        f"<td>{inline(c)}</td>" for c in row
-                    ) + "</tr>")
+                    out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in row) + "</tr>")
                     i += 1
                 out.append("</tbody></table>")
                 continue
@@ -273,9 +307,17 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         close_lists(); close_quote()
         html_text = "".join(out)
 
+    # Restore administrator blocks with distinctive formatting.
+    for idx, content in enumerate(admin_blocks):
+        safe = _html.escape(content, quote=False).replace("\n", "<br/>")
+        rendered = (
+            '<blockquote><b><i>Текст від Адміністратора каналу:</i></b><br/>'
+            f'<i>{safe}</i></blockquote>'
+        )
+        html_text = html_text.replace(f"__ADMIN_BLOCK_{idx}__", rendered)
+
     if collapse:
-        # Keep first heading + disclaimer + first short paragraph visible.
-        parts = re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>", html_text, re.I | re.S)
+        parts = re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>|<blockquote[^>]*>.*?</blockquote>", html_text, re.I | re.S)
         if len(parts) > 3:
             visible = "".join(parts[:3])
             rest = html_text[len(visible):]
@@ -284,74 +326,78 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
 
 
 
-async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None, collapse: bool = False) -> None:
-    """Send Telegram Rich Message; long content can be expandable."""
+
+async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None, collapse: bool = False):
+    """Send Telegram Rich Message and return its message id when available."""
     html_text = markdown_to_rich_html(html_text, collapse=collapse)
     token = bot.token
     url = f"https://api.telegram.org/bot{token}/sendRichMessage"
-    payload = {
-        "chat_id": chat_id,
-        "rich_message": {"html": html_text},
-        "disable_notification": False,
-    }
+    payload = {"chat_id": chat_id, "rich_message": {"html": html_text}, "disable_notification": False}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup.to_dict()
     async with httpx.AsyncClient(timeout=90) as client_http:
         response = await client_http.post(url, json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"Telegram sendRichMessage failed: {response.text}")
+        try:
+            result = response.json().get("result")
+            if isinstance(result, dict):
+                return result.get("message_id")
+        except Exception:
+            pass
+        return None
 
 
 
-async def send_plain_fallback(bot, chat_id: str | int, text: str, reply_markup=None) -> None:
-    """Fallback for malformed rich HTML or an unavailable Rich Message endpoint."""
+
+async def send_plain_fallback(bot, chat_id: str | int, text: str, reply_markup=None):
+    """Fallback for malformed rich HTML or unavailable Rich Message endpoint."""
     clean = text.replace("<hr/>", "\n──────────\n")
-    # Keep the disclaimer and article readable if the rich endpoint rejects malformed HTML.
     import re
     clean = re.sub(r"<[^>]+>", "", clean)
-    await bot.send_message(
-        chat_id=chat_id,
-        text=clean[:4096],
-        disable_web_page_preview=True,
-        reply_markup=reply_markup,
+    msg = await bot.send_message(
+        chat_id=chat_id, text=clean[:4096],
+        disable_web_page_preview=True, reply_markup=reply_markup,
     )
+    return getattr(msg, "message_id", None)
 
 
-async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=None, collapse: bool = False) -> None:
+
+async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=None, collapse: bool = False):
+    """Send text and return IDs of all messages belonging to this preview."""
+    sent_ids = []
     if len(text) <= 30000:
         try:
-            await send_rich_message(bot, chat_id, text, reply_markup, collapse=collapse)
-            return
+            mid = await send_rich_message(bot, chat_id, text, reply_markup, collapse=collapse)
         except Exception:
             logger.exception("Rich message failed; using plain fallback")
-            await send_plain_fallback(bot, chat_id, text, reply_markup)
-            return
+            mid = await send_plain_fallback(bot, chat_id, text, reply_markup)
+        if mid:
+            sent_ids.append(mid)
+        return sent_ids
 
-    chunks = []
-    remaining = text
+    chunks, remaining = [], text
     while len(remaining) > 30000:
         cut = remaining.rfind("</p>", 0, 30000)
-        if cut < 1000:
-            cut = remaining.rfind("</div>", 0, 30000)
-        if cut < 1000:
-            cut = remaining.rfind("\n", 0, 30000)
-        if cut < 1000:
-            cut = 30000
+        if cut < 1000: cut = remaining.rfind("</div>", 0, 30000)
+        if cut < 1000: cut = remaining.rfind("\n", 0, 30000)
+        if cut < 1000: cut = 30000
         cut = cut + 4 if remaining[cut:cut+4] == "</p>" else cut
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip()
-    if remaining:
-        chunks.append(remaining)
+    if remaining: chunks.append(remaining)
+
     for i, chunk in enumerate(chunks):
-        markup = reply_markup if i == len(chunks) - 1 else None
+        markup = reply_markup if i == len(chunks)-1 else None
         try:
-            await send_rich_message(
-                bot, chat_id, chunk, markup,
-                collapse=collapse if i == 0 else False
-            )
+            mid = await send_rich_message(bot, chat_id, chunk, markup, collapse=collapse if i == 0 else False)
         except Exception:
             logger.exception("Rich chunk failed; using plain fallback")
-            await send_plain_fallback(bot, chat_id, chunk, markup)
+            mid = await send_plain_fallback(bot, chat_id, chunk, markup)
+        if mid:
+            sent_ids.append(mid)
+    return sent_ids
+
 
 
 
@@ -437,6 +483,20 @@ async def favorites_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    if update.effective_user.id not in PENDING_DRAFT:
+        await update.message.reply_text("Спочатку створіть або відкрийте чернетку.")
+        return
+    context.user_data["admin_insert_mode"] = True
+    await update.message.reply_text(
+        "Надішліть текст вашої думки. Я збережу його як текст Адміністратора. "
+        "Щоб вставити його в потрібне місце, найнадійніше використовувати [[ADMIN]]...[[/ADMIN]] "
+        "у ручному тексті. Для швидкої вставки я додам його наприкінці поточної чернетки."
+    )
+
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
@@ -487,7 +547,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/post — створити статтю для погодження\n"
         "/preview — створити статтю без автоматичної публікації\n"
         "/ask [питання] — окремий аналіз будь-якого питання\n"
-        "/done — завершити ручне введення статті\n/cancel — скасувати поточну чернетку\n/favorites — моє «Обране»\n"
+        "/done — завершити ручне введення статті\n/cancel — скасувати поточну чернетку\n/favorites — моє «Обране»\n/admin — додати власну думку до поточної чернетки\n"
         "/help — довідка\n\n"
         "Щосуботи о 10:00 я автоматично готую статтю та надсилаю її вам на перевірку. "
         "У групу вона потрапляє лише після вашого підтвердження.\n\n"
@@ -548,6 +608,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "approve":
         try:
             await deliver_to_group(context.bot, draft)
+            await clear_draft_messages(context.bot, user_id)
             PENDING_DRAFT.pop(user_id, None)
             context.user_data.pop("revision_edit", None)
             context.user_data.pop("manual_edit", None)
@@ -563,7 +624,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("manual_edit", None)
         context.user_data.pop("manual_parts", None)
         await query.message.reply_text(
-            "Напишіть одним повідомленням, що саме потрібно змінити. Я перероблю поточну версію."
+            "Напишіть одним повідомленням, що саме потрібно змінити. Я перероблю поточну версію. Власну думку, яку треба дослівно вставити, можна позначити [[ADMIN]]...[[/ADMIN]]."
         )
         return
 
@@ -586,6 +647,24 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+
+    if context.user_data.get("admin_insert_mode"):
+        admin_text = update.message.text.strip()
+        if not admin_text:
+            return
+        draft = PENDING_DRAFT.get(user_id)
+        if not draft:
+            context.user_data.pop("admin_insert_mode", None)
+            await update.message.reply_text("Поточна чернетка вже відсутня.")
+            return
+        context.user_data.pop("admin_insert_mode", None)
+        PENDING_DRAFT[user_id] = draft + "\n\n[[ADMIN]]" + admin_text + "[[/ADMIN]]"
+        await update.message.reply_text(
+            "Думку додано до чернетки. Для вставлення її в інше місце скористайтеся «Ввести свій текст» "
+            "і маркерами [[ADMIN]]...[[/ADMIN]]."
+        )
+        await show_draft(update, context, PENDING_DRAFT[user_id], collapsed=True)
+        return
 
     if context.user_data.get("awaiting_question"):
         question = update.message.text.strip()
@@ -666,6 +745,7 @@ def main():
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("favorites", favorites_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("done", done_edit))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
