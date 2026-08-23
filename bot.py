@@ -70,13 +70,39 @@ async def generate_answer(question: str) -> str:
     )
     return response.output_text.strip()
 
+async def revise_draft(draft: str, instruction: str) -> str:
+    prompt = f"""Ти редагуєш уже підготовлений матеріал «Технократа».
+
+Користувач просить внести такі зміни:
+{instruction}
+
+Відредагуй текст відповідно до прохання.
+Зберігай сильні частини початкового матеріалу, якщо користувач не просить їх змінювати.
+Не скорочуй матеріал без потреби.
+Не додавай вигаданих фактів, цифр, цитат або джерел.
+Якщо для зміни потрібна нова фактична інформація, перевір її вебпошуком.
+Зберігай українську мову, живий, інтелектуальний, зрозумілий і прямий стиль; за доречності допускається гостра подача.
+Не називай жоден розділ «Аналіз Технократа».
+Поверни повністю оновлений текст статті, а не перелік внесених змін.
+
+ПОЧАТКОВИЙ ТЕКСТ:
+{draft}
+"""
+    response = await client.responses.create(
+        model=MODEL,
+        tools=[{"type": "web_search"}],
+        input=SYSTEM_PROMPT + "\n\n" + prompt,
+    )
+    return response.output_text.strip()
+
+
 
 def approval_keyboard():
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Підтвердити і відправити", callback_data="approve")],
-        [InlineKeyboardButton("✏️ Ввести свій текст", callback_data="edit"),
-         InlineKeyboardButton("🗑 Відхилити", callback_data="reject")],
+        [InlineKeyboardButton("✏️ Внести правки", callback_data="revise"),
+         InlineKeyboardButton("📝 Ввести свій текст", callback_data="edit")],
     ])
 
 
@@ -311,17 +337,42 @@ async def done_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parts:
         await update.message.reply_text("Ви ще не надіслали текст.")
         return
+
     draft = "\n\n".join(parts).strip()
-    PENDING_DRAFT[update.effective_user.id] = draft
+    user_id = update.effective_user.id
+    PENDING_DRAFT[user_id] = draft
     context.user_data.pop("manual_edit", None)
     context.user_data.pop("manual_parts", None)
+
     await update.message.reply_text("Готово. Ваш текст встановлено як нову чернетку. Перевірте його:")
-    await send_long_message(context.bot, str(update.effective_user.id), draft, approval_keyboard())
+    await send_long_message(
+        context.bot,
+        str(user_id),
+        draft,
+        approval_keyboard(),
+    )
+
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    user_id = update.effective_user.id
+    existed = PENDING_DRAFT.pop(user_id, None) is not None
+    context.user_data.pop("revision_edit", None)
+    context.user_data.pop("manual_edit", None)
+    context.user_data.pop("manual_parts", None)
+    context.user_data.pop("awaiting_question", None)
+    if existed:
+        await update.message.reply_text("Поточну чернетку скасовано. Її не буде опубліковано.")
+    else:
+        await update.message.reply_text("Активної чернетки немає.")
 
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
+
     question = " ".join(context.args).strip()
     if not question:
         context.user_data["awaiting_question"] = True
@@ -329,13 +380,25 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Напишіть питання одним повідомленням. Я проведу вебпошук і зроблю окремий аналіз."
         )
         return
+
     await update.message.reply_text("Шукаю інформацію та готую відповідь…")
     try:
         answer = await generate_answer(question)
-        await send_long_message(context.bot, str(update.effective_user.id), answer)
+        PENDING_DRAFT[update.effective_user.id] = answer
+        await send_long_message(
+            context.bot,
+            str(update.effective_user.id),
+            answer,
+            approval_keyboard(),
+        )
+        await update.message.reply_text(
+            "Це чернетка аналізу. Можна підтвердити публікацію, внести правки запитом, "
+            "повністю замінити текст вручну."
+        )
     except Exception as exc:
         logger.exception("Question analysis failed")
         await update.message.reply_text(f"Помилка: {type(exc).__name__}: {exc}")
+
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,11 +409,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/post — створити статтю для погодження\n"
         "/preview — створити статтю без автоматичної публікації\n"
         "/ask [питання] — окремий аналіз будь-якого питання\n"
-        "/done — завершити ручне введення статті\n"
+        "/done — завершити ручне введення статті\n/cancel — скасувати поточну чернетку\n"
         "/help — довідка\n\n"
         "Щосуботи о 10:00 я автоматично готую статтю та надсилаю її вам на перевірку. "
         "У групу вона потрапляє лише після вашого підтвердження.\n\n"
-        "Кнопка «Ввести свій текст» дозволяє повністю замінити чернетку вручну."
+        "Кнопка «Внести правки» дозволяє дати текстову вказівку, і бот переробить поточну версію. Кнопка «Ввести свій текст» дозволяє повністю замінити чернетку вручну. Якщо матеріал не потрібен, його можна просто не публікувати або скасувати через /cancel. Після /ask результат також стає чернеткою, яку можна редагувати та публікувати."
     )
 
 
@@ -363,27 +426,41 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not query.from_user or query.from_user.id != ADMIN_ID:
         return
+
     chat_id = query.from_user.id
     draft = PENDING_DRAFT.get(chat_id)
     if not draft:
-        await query.message.reply_text("Чернетка вже відсутня або була оброблена. Створіть нову через /preview.")
+        await query.message.reply_text(
+            "Чернетка вже відсутня або була оброблена. Створіть нову через /preview або /ask."
+        )
         return
+
     if query.data == "approve":
         try:
             await deliver_to_group(context.bot, draft)
             PENDING_DRAFT.pop(chat_id, None)
-            await query.message.reply_text("Готово. Статтю підтверджено та відправлено в групу.")
+            context.user_data.pop("revision_edit", None)
+            context.user_data.pop("manual_edit", None)
+            context.user_data.pop("manual_parts", None)
+            await query.message.reply_text("Готово. Матеріал підтверджено та відправлено в групу.")
         except Exception as exc:
             logger.exception("Publication failed")
             await query.message.reply_text(f"Не вдалося опублікувати: {type(exc).__name__}: {exc}")
-    elif query.data == "reject":
-        PENDING_DRAFT.pop(chat_id, None)
+
+    elif query.data == "revise":
+        context.user_data["revision_edit"] = True
         context.user_data.pop("manual_edit", None)
         context.user_data.pop("manual_parts", None)
-        await query.message.reply_text("Чернетку відхилено.")
+        await query.message.reply_text(
+            "Напишіть одним повідомленням, що саме потрібно змінити. "
+            "Наприклад: «Скороти вступ удвічі, додай більше даних про Європу "
+            "і зроби висновок гострішим». Я перероблю поточну версію та знову покажу її на погодження."
+        )
+
     elif query.data == "edit":
         context.user_data["manual_edit"] = True
         context.user_data["manual_parts"] = []
+        context.user_data.pop("revision_edit", None)
         await query.message.reply_text(
             "Надішліть свій готовий текст замість цієї чернетки. "
             "Можна одним повідомленням або кількома частинами. "
@@ -392,9 +469,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
 async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
+
+    user_id = update.effective_user.id
 
     if context.user_data.get("awaiting_question"):
         question = update.message.text.strip()
@@ -402,10 +483,46 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Шукаю інформацію та готую відповідь…")
         try:
             answer = await generate_answer(question)
-            await send_long_message(context.bot, str(update.effective_user.id), answer)
+            PENDING_DRAFT[user_id] = answer
+            await send_long_message(
+                context.bot,
+                str(user_id),
+                answer,
+                approval_keyboard(),
+            )
+            await update.message.reply_text(
+                "Це тепер чернетка аналізу. Її можна підтвердити, відредагувати запитом, "
+                "повністю замінити вручну або відхилити."
+            )
         except Exception as exc:
             logger.exception("Question analysis failed")
             await update.message.reply_text(f"Помилка: {type(exc).__name__}: {exc}")
+        return
+
+    if context.user_data.get("revision_edit"):
+        instruction = update.message.text.strip()
+        if not instruction:
+            return
+        draft = PENDING_DRAFT.get(user_id)
+        if not draft:
+            context.user_data.pop("revision_edit", None)
+            await update.message.reply_text("Поточна чернетка вже відсутня. Створіть новий аналіз через /ask.")
+            return
+
+        context.user_data.pop("revision_edit", None)
+        await update.message.reply_text("Вношу правки та перевіряю фактичні зміни…")
+        try:
+            revised = await revise_draft(draft, instruction)
+            PENDING_DRAFT[user_id] = revised
+            await send_long_message(
+                context.bot,
+                str(user_id),
+                revised,
+                approval_keyboard(),
+            )
+        except Exception as exc:
+            logger.exception("Draft revision failed")
+            await update.message.reply_text(f"Помилка під час редагування: {type(exc).__name__}: {exc}")
         return
 
     if not context.user_data.get("manual_edit"):
@@ -419,6 +536,7 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Отримала частину {count}. Надішліть наступну частину або /done, якщо це був останній фрагмент."
     )
+
 
 
 
@@ -436,6 +554,7 @@ def main():
     app.add_handler(CommandHandler("post", make_post))
     app.add_handler(CommandHandler("preview", preview))
     app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("done", done_edit))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
