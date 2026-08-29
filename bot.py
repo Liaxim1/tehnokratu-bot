@@ -183,16 +183,12 @@ async def show_draft(update_or_message, context, text: str, collapsed: bool = Tr
 
 
 def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
-    """Convert Markdown to Telegram Rich Message HTML.
-    Administrator text is marked with [[ADMIN]]...[[/ADMIN]] or [[ADMIN: ...]]
-    and rendered in a visibly different italic style with a fixed label.
-    """
+    """Convert article Markdown/HTML into readable Telegram Rich Message HTML."""
     import re
     import html as _html
 
-    # Protect administrator blocks before normal Markdown processing.
+    # Protect administrator blocks and the publication disclaimer.
     admin_blocks = []
-
     def protect_admin(match):
         content = (match.group(1) if match.group(1) is not None else match.group(2)).strip()
         token = f"__ADMIN_BLOCK_{len(admin_blocks)}__"
@@ -201,19 +197,29 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
 
     text = re.sub(
         r"\[\[ADMIN\]\](.*?)\[\[/ADMIN\]\]|\[\[ADMIN:\s*(.*?)\]\]",
-        protect_admin,
-        text,
-        flags=re.I | re.S,
+        protect_admin, text, flags=re.I | re.S
     )
 
-    if re.search(r"<h[1-6][^>]*>|<p[^>]*>|<table[^>]*>", text, re.I):
+    disclaimer_token = "[[AI_DISCLAIMER]]"
+    has_disclaimer = disclaimer_token in text
+    text = text.replace(disclaimer_token, "__AI_DISCLAIMER__")
+
+    # Only treat input as already-HTML when it is genuinely HTML and does not
+    # contain obvious Markdown syntax. This prevents one HTML fragment from
+    # disabling conversion of the rest of a Markdown article.
+    has_markdown = bool(re.search(
+        r"(?m)^\s{0,3}#{1,6}\s+|\*\*[^*]+\*\*|\[([^\]]+)\]\(https?://|^\s*[-*+]\s+|^\s*\d+[.)]\s+",
+        text
+    ))
+    looks_like_html = bool(re.match(r"^\s*<(?:html|article|h[1-6]|p|div|table|blockquote)\b", text, re.I))
+    use_existing_html = looks_like_html and not has_markdown
+
+    if use_existing_html:
         html_text = text
     else:
         lines = text.replace("\r\n", "\n").split("\n")
         out = []
-        in_ul = False
-        in_ol = False
-        in_quote = False
+        in_ul = in_ol = in_quote = False
         i = 0
 
         def inline(s: str) -> str:
@@ -242,20 +248,24 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
-            if not stripped:
-                close_lists(); close_quote(); i += 1; continue
 
+            if not stripped:
+                close_lists(); close_quote()
+                i += 1
+                continue
+
+            # Markdown table.
             if i + 1 < len(lines) and "|" in line and re.match(
                 r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$",
-                lines[i+1]
+                lines[i + 1]
             ):
                 close_lists(); close_quote()
                 def cells(x):
                     return [c.strip() for c in x.strip().strip("|").split("|")]
                 headers = cells(line)
-                out.append("<table><thead><tr>" + "".join(
-                    f"<th>{inline(c)}</th>" for c in headers
-                ) + "</tr></thead><tbody>")
+                out.append("<table><thead><tr>" +
+                           "".join(f"<th>{inline(c)}</th>" for c in headers) +
+                           "</tr></thead><tbody>")
                 i += 2
                 while i < len(lines) and "|" in lines[i] and lines[i].strip():
                     row = cells(lines[i])
@@ -264,15 +274,20 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                 out.append("</tbody></table>")
                 continue
 
+            # Heading.
             m = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
             if m:
                 close_lists(); close_quote()
                 level = min(len(m.group(1)), 4)
                 out.append(f"<h{level}>{inline(m.group(2))}</h{level}>")
-                i += 1; continue
+                i += 1
+                continue
 
             if re.match(r"^\s*(---+|___+|\*\s*\*\s*\*+)\s*$", line):
-                close_lists(); close_quote(); out.append("<hr/>"); i += 1; continue
+                close_lists(); close_quote()
+                out.append("<hr/>")
+                i += 1
+                continue
 
             m = re.match(r"^\s*[-*+]\s+(.+)$", line)
             if m:
@@ -281,7 +296,8 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                     if in_ol: out.append("</ol>"); in_ol = False
                     out.append("<ul>"); in_ul = True
                 out.append(f"<li>{inline(m.group(1))}</li>")
-                i += 1; continue
+                i += 1
+                continue
 
             m = re.match(r"^\s*\d+[.)]\s+(.+)$", line)
             if m:
@@ -290,7 +306,8 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                     if in_ul: out.append("</ul>"); in_ul = False
                     out.append("<ol>"); in_ol = True
                 out.append(f"<li>{inline(m.group(1))}</li>")
-                i += 1; continue
+                i += 1
+                continue
 
             m = re.match(r"^\s*>\s?(.*)$", line)
             if m:
@@ -298,7 +315,8 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                 if not in_quote:
                     out.append("<blockquote>"); in_quote = True
                 out.append(inline(m.group(1)) + "<br/>")
-                i += 1; continue
+                i += 1
+                continue
 
             close_lists(); close_quote()
             out.append(f"<p>{inline(stripped)}</p>")
@@ -307,7 +325,7 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         close_lists(); close_quote()
         html_text = "".join(out)
 
-    # Restore administrator blocks with distinctive formatting.
+    # Restore administrator text.
     for idx, content in enumerate(admin_blocks):
         safe = _html.escape(content, quote=False).replace("\n", "<br/>")
         rendered = (
@@ -316,13 +334,28 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         )
         html_text = html_text.replace(f"__ADMIN_BLOCK_{idx}__", rendered)
 
+    # Restore the publication disclaimer directly as a normal paragraph.
+    if has_disclaimer:
+        disclaimer_html = (
+            '<p><i>Стаття створена ШІ й акцептована відправка в групу Адміністратором.</i></p>'
+        )
+        html_text = html_text.replace("<p>__AI_DISCLAIMER__</p>", disclaimer_html)
+        html_text = html_text.replace("__AI_DISCLAIMER__", disclaimer_html)
+
     if collapse:
-        parts = re.findall(r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>|<blockquote[^>]*>.*?</blockquote>", html_text, re.I | re.S)
+        # Native Rich Message details block. Unlike the old expandable blockquote,
+        # the article body remains normal paragraphs/headings/lists after expansion.
+        parts = re.findall(
+            r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>|<ul>.*?</ul>|<ol>.*?</ol>|<table>.*?</table>|<hr/>",
+            html_text, re.I | re.S
+        )
         if len(parts) > 3:
             visible = "".join(parts[:3])
             rest = html_text[len(visible):]
-            return visible + f'<blockquote expandable>{rest}</blockquote>'
+            return visible + f'<details><summary>Показати більше</summary>{rest}</details>'
+
     return html_text
+
 
 
 
@@ -402,19 +435,32 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
 
 
 async def deliver_to_group(bot, text: str):
-    # The disclaimer is inserted by the bot, not by the model.
-    # It is placed directly under the first title/heading block.
-    disclaimer = "<p><i>Стаття створена ШІ й акцептована відправка в групу Адміністратором.</i></p>"
-    if text:
+    """Publish the approved article to the channel as a readable Rich Message."""
+    # Keep the disclaimer as a protected token. Mixing raw <p> HTML into Markdown
+    # previously made the converter treat the whole article as already-HTML, which
+    # exposed #, ** and [link](url) literally in the channel.
+    disclaimer_token = "[[AI_DISCLAIMER]]"
+    if text and disclaimer_token not in text:
         import re
-        match = re.search(r"(<h[1-6][^>]*>.*?</h[1-6]>)", text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            insert_at = match.end()
-            text = text[:insert_at] + disclaimer + text[insert_at:]
+        # Markdown heading: put the disclaimer immediately after the first title.
+        md = re.search(r"(?m)^\s*#{1,6}\s+.+?\s*#*\s*$", text)
+        if md:
+            insert_at = md.end()
+            text = text[:insert_at] + "\n\n" + disclaimer_token + "\n" + text[insert_at:]
         else:
-            # Fallback if the model did not produce an HTML heading.
-            text = disclaimer + text
+            # HTML heading fallback, for manually supplied HTML.
+            html = re.search(r"(<h[1-6][^>]*>.*?</h[1-6]>)", text, flags=re.I | re.S)
+            if html:
+                insert_at = html.end()
+                text = text[:insert_at] + disclaimer_token + text[insert_at:]
+            else:
+                text = disclaimer_token + "\n" + text
+
+    # Use native Telegram Rich Message <details> for the channel. This gives each
+    # subscriber their own expand/collapse state and avoids turning the article body
+    # into a giant quotation block.
     await send_long_message(bot, CHANNEL_ID, text, collapse=True)
+
 
 
 
