@@ -343,16 +343,71 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         html_text = html_text.replace("__AI_DISCLAIMER__", disclaimer_html)
 
     if collapse:
-        # Native Rich Message details block. Unlike the old expandable blockquote,
-        # the article body remains normal paragraphs/headings/lists after expansion.
+        # Use Telegram's native <details> disclosure control only.
+        # A <summary> inside it creates a second, non-functional "Показати більше"
+        # row on some Android clients, while the native blue control is the real
+        # disclosure button. Therefore the details block intentionally has no
+        # explicit <summary>.
         parts = re.findall(
             r"<h[1-6][^>]*>.*?</h[1-6]>|<p[^>]*>.*?</p>|<ul>.*?</ul>|<ol>.*?</ol>|<table>.*?</table>|<hr/>",
             html_text, re.I | re.S
         )
         if len(parts) > 3:
-            visible = "".join(parts[:3])
-            rest = html_text[len(visible):]
-            return visible + f'<details><summary>Показати більше</summary>{rest}</details>'
+            title_idx = next((i for i,p in enumerate(parts) if re.match(r"<h[1-6]", p, re.I)), None)
+            disclaimer_idx = next((i for i,p in enumerate(parts) if "Стаття створена ШІ" in p), None)
+
+            keep = []
+            if title_idx is not None: keep.append(title_idx)
+            if disclaimer_idx is not None: keep.append(disclaimer_idx)
+
+            # Show a short lead/annotation in the collapsed preview.
+            lead_idx = None
+            lead_preview = ""
+            for i,p in enumerate(parts):
+                if re.match(r"<p\b", p, re.I) and "Стаття створена ШІ" not in p:
+                    plain = re.sub(r"<[^>]+>", " ", p)
+                    plain = re.sub(r"\s+", " ", plain).strip()
+                    if len(plain) >= 40:
+                        lead_idx = i
+                        if len(plain) > 360:
+                            sentences = re.split(r"(?<=[.!?])\s+", plain)
+                            chosen = ""
+                            for s in sentences:
+                                candidate = (chosen + " " + s).strip()
+                                if len(candidate) <= 360:
+                                    chosen = candidate
+                                else:
+                                    break
+                            if len(chosen) < 100:
+                                chosen = plain[:357].rstrip() + "…"
+                            elif not chosen.endswith((".", "!", "?", "…")):
+                                chosen += "…"
+                            lead_preview = f"<p>{_html.escape(chosen, quote=False)}</p>"
+                        else:
+                            lead_preview = p
+                        keep.append(i)
+                        break
+
+            keep=set(keep)
+            visible_parts=[]
+            rest_parts=[]
+            for i,p in enumerate(parts):
+                if i in keep:
+                    visible_parts.append(lead_preview if i == lead_idx else p)
+                    # If the lead was truncated, keep the full original paragraph
+                    # inside the expandable part so no information is lost.
+                    if i == lead_idx and lead_preview != p:
+                        rest_parts.append(p)
+                else:
+                    rest_parts.append(p)
+
+            visible="".join(visible_parts)
+            rest="".join(rest_parts)
+            if rest.strip():
+                # No <summary>: Telegram renders its own working "Показати більше"
+                # control. After expansion it becomes the corresponding collapse
+                # control in supported clients.
+                return visible + f"<details>{rest}</details>"
 
     return html_text
 
