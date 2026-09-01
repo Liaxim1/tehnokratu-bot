@@ -404,10 +404,10 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
             visible="".join(visible_parts)
             rest="".join(rest_parts)
             if rest.strip():
-                # No <summary>: Telegram renders its own working "Показати більше"
-                # control. After expansion it becomes the corresponding collapse
-                # control in supported clients.
-                return visible + f"<details>{rest}</details>"
+                # Use an explicit Telegram Rich Message summary so the disclosure
+                # control has a real target instead of relying on the client
+                # fallback summary.
+                return visible + f"<details><summary>Показати більше</summary>{rest}</details>"
 
     return html_text
 
