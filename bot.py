@@ -415,12 +415,116 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
 
 
 
-async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None, collapse: bool = False):
+class _RichHTMLParser(__import__("html.parser", fromlist=["HTMLParser"]).HTMLParser):
+    """Small HTML -> Telegram InputRichBlock converter for native rich blocks."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root=[]
+        self.stack=[]
+
+    def _container(self):
+        return self.stack[-1]["children"] if self.stack else self.root
+
+    def handle_starttag(self, tag, attrs):
+        tag=tag.lower()
+        if tag in {"p","h1","h2","h3","h4","h5","h6","blockquote","ul","ol","li","pre","code","b","strong","i","em","u","s","del","a","details","summary"}:
+            node={"tag":tag,"attrs":dict(attrs),"children":[] ,"text":""}
+            self._container().append(node)
+            self.stack.append(node)
+        elif tag=="br":
+            self._container().append({"tag":"#text","text":"\n","children":[]})
+        elif tag=="hr":
+            self._container().append({"tag":"hr","children":[]})
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in {"br","hr"}:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        tag=tag.lower()
+        for i in range(len(self.stack)-1,-1,-1):
+            if self.stack[i]["tag"]==tag:
+                self.stack=self.stack[:i]
+                return
+
+    def handle_data(self, data):
+        if data:
+            self._container().append({"tag":"#text","text":data,"children":[]})
+
+def _rich_inline(nodes):
+    out=[]
+    for n in nodes:
+        tag=n["tag"]
+        if tag=="#text":
+            out.append(n["text"]); continue
+        inner=_rich_inline(n.get("children",[]))
+        if tag in {"b","strong"}: out.append({"type":"bold","text":inner})
+        elif tag in {"i","em"}: out.append({"type":"italic","text":inner})
+        elif tag=="u": out.append({"type":"underline","text":inner})
+        elif tag in {"s","del"}: out.append({"type":"strikethrough","text":inner})
+        elif tag=="code": out.append({"type":"code","text":inner})
+        elif tag=="a": out.append({"type":"url","text":inner,"url":n.get("attrs",{}).get("href","")})
+        elif tag=="br": out.append("\n")
+        else: out.append(inner)
+    return out if len(out)>1 else (out[0] if out else "")
+
+def _rich_blocks(nodes):
+    blocks=[]
+    for n in nodes:
+        tag=n["tag"]
+        if tag=="#text":
+            txt=n["text"].strip()
+            if txt: blocks.append({"type":"paragraph","text":txt})
+        elif tag in {"p","footer"}:
+            txt=_rich_inline(n.get("children",[]))
+            if txt: blocks.append({"type":"paragraph" if tag=="p" else "footer","text":txt})
+        elif tag in {"h1","h2","h3","h4","h5","h6"}:
+            txt=_rich_inline(n.get("children",[]))
+            if txt: blocks.append({"type":"heading","text":txt,"size":min(int(tag[1]),6)})
+        elif tag=="hr": blocks.append({"type":"divider"})
+        elif tag=="blockquote":
+            inner=_rich_blocks(n.get("children",[]))
+            if inner: blocks.append({"type":"blockquote","blocks":inner})
+        elif tag in {"ul","ol"}:
+            items=[]
+            for li in n.get("children",[]):
+                if li.get("tag")!="li": continue
+                ib=_rich_blocks(li.get("children",[]))
+                if ib: items.append({"blocks":ib})
+            if items: blocks.append({"type":"list","items":items})
+        elif tag=="pre":
+            txt=_rich_inline(n.get("children",[]))
+            if txt: blocks.append({"type":"pre","text":txt})
+        elif tag=="details":
+            summary="Показати більше"
+            body=[]
+            for c in n.get("children",[]):
+                if c.get("tag")=="summary": summary=_rich_inline(c.get("children",[]))
+                else: body.extend(_rich_blocks([c]))
+            if body: blocks.append({"type":"details","summary":summary,"blocks":body})
+        elif tag=="summary":
+            continue
+    return blocks
+
+def html_to_rich_blocks(html_text: str):
+    parser=_RichHTMLParser(); parser.feed(html_text); parser.close()
+    return _rich_blocks(parser.root)
+
+
+
+async def send_rich_message(bot, chat_id: str | int, html_text: str, reply_markup=None, collapse: bool = False, native_blocks: bool = False):
     """Send Telegram Rich Message and return its message id when available."""
-    html_text = markdown_to_rich_html(html_text, collapse=collapse)
+    html_text = markdown_to_rich_html(html_text, collapse=False)
     token = bot.token
     url = f"https://api.telegram.org/bot{token}/sendRichMessage"
-    payload = {"chat_id": chat_id, "rich_message": {"html": html_text}, "disable_notification": False}
+    if native_blocks:
+        blocks = html_to_rich_blocks(html_text)
+        payload = {"chat_id": chat_id, "rich_message": {"blocks": blocks}, "disable_notification": False}
+    else:
+        if collapse:
+            html_text = markdown_to_rich_html(html_text, collapse=True)
+        payload = {"chat_id": chat_id, "rich_message": {"html": html_text}, "disable_notification": False}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup.to_dict()
     async with httpx.AsyncClient(timeout=90) as client_http:
@@ -490,33 +594,58 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
 
 
 async def deliver_to_group(bot, text: str):
-    """Publish the approved article to the channel as a readable Rich Message."""
-    # Keep the disclaimer as a protected token. Mixing raw <p> HTML into Markdown
-    # previously made the converter treat the whole article as already-HTML, which
-    # exposed #, ** and [link](url) literally in the channel.
+    """Publish approved article using Telegram's native Rich Message blocks.
+
+    The entire article is represented as one native details block. This avoids
+    Telegram's separate generic "Show more" truncation button and leaves a single
+    disclosure control for the article itself.
+    """
     disclaimer_token = "[[AI_DISCLAIMER]]"
     if text and disclaimer_token not in text:
         import re
-        # Markdown heading: put the disclaimer immediately after the first title.
         md = re.search(r"(?m)^\s*#{1,6}\s+.+?\s*#*\s*$", text)
         if md:
             insert_at = md.end()
             text = text[:insert_at] + "\n\n" + disclaimer_token + "\n" + text[insert_at:]
         else:
-            # HTML heading fallback, for manually supplied HTML.
-            html = re.search(r"(<h[1-6][^>]*>.*?</h[1-6]>)", text, flags=re.I | re.S)
-            if html:
-                insert_at = html.end()
-                text = text[:insert_at] + disclaimer_token + text[insert_at:]
-            else:
-                text = disclaimer_token + "\n" + text
+            text = disclaimer_token + "\n" + text
 
-    # Use native Telegram Rich Message <details> for the channel. This gives each
-    # subscriber their own expand/collapse state and avoids turning the article body
-    # into a giant quotation block.
-    await send_long_message(bot, CHANNEL_ID, text, collapse=True)
+    html_text = markdown_to_rich_html(text, collapse=False)
+    blocks = html_to_rich_blocks(html_text)
+    if len(blocks) > 3:
+        # IMPORTANT: make the article itself one native details block. Keeping any
+        # long article content outside details lets Telegram's generic long-message
+        # truncation create a second blue "Show more" button. A single native
+        # details block gives the client exactly one disclosure control.
+        title_idx = next((i for i,b in enumerate(blocks) if b.get("type")=="heading"), None)
+        notice_idx = next((i for i,b in enumerate(blocks) if "Стаття створена ШІ" in str(b.get("text",""))), None)
+        lead_idx = next((i for i,b in enumerate(blocks) if b.get("type")=="paragraph" and "Стаття створена ШІ" not in str(b.get("text",""))), None)
 
+        def plain_rich(value):
+            if isinstance(value, str): return value
+            if isinstance(value, list): return "".join(plain_rich(v) for v in value)
+            if isinstance(value, dict): return plain_rich(value.get("text", ""))
+            return str(value)
 
+        summary_parts=[]
+        for idx in (title_idx, notice_idx, lead_idx):
+            if idx is not None:
+                txt=plain_rich(blocks[idx].get("text", ""))
+                if txt:
+                    summary_parts.append(txt)
+        summary="\n\n".join(summary_parts) or "Розгорнути"
+
+        # The hidden content contains the complete original article, including the
+        # title/notice/lead as well, so expanding always reveals the complete post.
+        details={"type":"details","summary":summary,"blocks":blocks,"is_open":False}
+        blocks=[details]
+    payload={"chat_id":CHANNEL_ID,"rich_message":{"blocks":blocks},"disable_notification":False}
+    token=bot.token
+    url=f"https://api.telegram.org/bot{token}/sendRichMessage"
+    async with httpx.AsyncClient(timeout=90) as client_http:
+        response=await client_http.post(url,json=payload)
+        if response.status_code != 200:
+            raise RuntimeError(f"Telegram sendRichMessage failed: {response.text}")
 
 
 async def create_and_send_for_approval(bot, chat_id: int):
