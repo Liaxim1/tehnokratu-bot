@@ -226,14 +226,47 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
         i = 0
 
         def inline(s: str) -> str:
+            # Convert Markdown inline markup without allowing the automatic URL
+            # pass to touch href attributes. The previous implementation first
+            # created <a href="..."> and then ran the URL regex over that HTML,
+            # which could corrupt links and make their visible text disappear in
+            # Rich Messages (shown as empty parentheses in Telegram).
+            placeholders = []
+
+            def stash(value: str) -> str:
+                token = f"@@INLINE_{len(placeholders)}@@"
+                placeholders.append(value)
+                return token
+
+            # Markdown links: support URLs containing balanced parentheses too.
+            link_re = re.compile(r"\[([^\]]+)\]\((https?://(?:[^()\s]|\([^()]*\))+?)\)")
+            def link_sub(m):
+                label = _html.escape(m.group(1), quote=False)
+                href = _html.escape(m.group(2), quote=True)
+                return stash(f'<a href="{href}">{label}</a>')
+            s = link_re.sub(link_sub, s)
+
+            # Inline code is protected before applying emphasis.
+            s = re.sub(r"`([^`]+)`", lambda m: stash(f'<code>{_html.escape(m.group(1), quote=False)}</code>'), s)
+
             s = _html.escape(s, quote=False)
-            s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
-            s = re.sub(r'(?<!["=])(https?://[^\s<]+)', r'<a href="\1">\1</a>', s)
-            s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+
+            # Plain URLs are linked only in the remaining text, never inside the
+            # already-protected Markdown links/code.
+            s = re.sub(
+                r'(?<!["=])(https?://[^\s<]+)',
+                lambda m: stash(f'<a href="{_html.escape(m.group(1), quote=True)}">{_html.escape(m.group(1), quote=False)}</a>'),
+                s
+            )
+
             s = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
             s = re.sub(r"__([^_]+)__", r"<b>\1</b>", s)
             s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", s)
             s = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", s)
+
+            # Restore protected fragments after all text-level substitutions.
+            for idx, value in enumerate(placeholders):
+                s = s.replace(f"@@INLINE_{idx}@@", value)
             return s
 
         def close_lists():
