@@ -50,6 +50,9 @@ async def generate_review(editor_note: str = "") -> str:
 
 PENDING_DRAFT: dict[int, str] = {}
 DRAFT_MESSAGE_IDS: dict[int, list[int]] = {}  # current preview messages per admin
+# Channel posts with a custom expand/collapse button. State is intentionally in-memory;
+# the button is relevant to the currently running bot instance.
+CHANNEL_POST_STATES: dict[str, dict] = {}
 FAVORITES_FILE = os.getenv("FAVORITES_FILE", "favorites.json")
 FAVORITES: dict[int, list[dict[str, str]]] = {}
 
@@ -594,15 +597,20 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
 
 
 async def deliver_to_group(bot, text: str):
-    """Publish approved article using Telegram's native Rich Message blocks.
+    """Publish an approved article with exactly one custom Rich Message button.
 
-    The entire article is represented as one native details block. This avoids
-    Telegram's separate generic "Show more" truncation button and leaves a single
-    disclosure control for the article itself.
+    We deliberately do not use Telegram's native <details> block here. In the
+    Android client it can coexist with the client's own long-message "Show more"
+    control, producing two different expand affordances. Instead, the post is
+    sent in a compact state with one primary Rich Message button; pressing it
+    edits the same channel message to the full article, and the same button then
+    becomes "Згорнути".
     """
+    import re
+    import secrets
+
     disclaimer_token = "[[AI_DISCLAIMER]]"
     if text and disclaimer_token not in text:
-        import re
         md = re.search(r"(?m)^\s*#{1,6}\s+.+?\s*#*\s*$", text)
         if md:
             insert_at = md.end()
@@ -611,41 +619,65 @@ async def deliver_to_group(bot, text: str):
             text = disclaimer_token + "\n" + text
 
     html_text = markdown_to_rich_html(text, collapse=False)
-    blocks = html_to_rich_blocks(html_text)
-    if len(blocks) > 3:
-        # IMPORTANT: make the article itself one native details block. Keeping any
-        # long article content outside details lets Telegram's generic long-message
-        # truncation create a second blue "Show more" button. A single native
-        # details block gives the client exactly one disclosure control.
-        title_idx = next((i for i,b in enumerate(blocks) if b.get("type")=="heading"), None)
-        notice_idx = next((i for i,b in enumerate(blocks) if "Стаття створена ШІ" in str(b.get("text",""))), None)
-        lead_idx = next((i for i,b in enumerate(blocks) if b.get("type")=="paragraph" and "Стаття створена ШІ" not in str(b.get("text",""))), None)
+    full_blocks = html_to_rich_blocks(html_text)
 
-        def plain_rich(value):
-            if isinstance(value, str): return value
-            if isinstance(value, list): return "".join(plain_rich(v) for v in value)
-            if isinstance(value, dict): return plain_rich(value.get("text", ""))
-            return str(value)
+    # Make sure the first line is rendered as a real heading even if a manually
+    # entered article omitted Markdown's # before the title.
+    if full_blocks and full_blocks[0].get("type") == "paragraph":
+        first_text = full_blocks[0].get("text", "")
+        if isinstance(first_text, str) and first_text.strip():
+            full_blocks[0] = {"type": "heading", "text": first_text.strip(), "size": 2}
 
-        summary_parts=[]
-        for idx in (title_idx, notice_idx, lead_idx):
-            if idx is not None:
-                txt=plain_rich(blocks[idx].get("text", ""))
-                if txt:
-                    summary_parts.append(txt)
-        summary="\n\n".join(summary_parts) or "Розгорнути"
+    # Compact preview: title + publication notice + first meaningful paragraph.
+    title_idx = next((i for i, b in enumerate(full_blocks) if b.get("type") == "heading"), None)
+    notice_idx = next((i for i, b in enumerate(full_blocks)
+                       if "Стаття створена ШІ" in str(b.get("text", ""))), None)
+    lead_idx = next((i for i, b in enumerate(full_blocks)
+                     if b.get("type") == "paragraph" and i != notice_idx), None)
 
-        # The hidden content contains the complete original article, including the
-        # title/notice/lead as well, so expanding always reveals the complete post.
-        details={"type":"details","summary":summary,"blocks":blocks,"is_open":False}
-        blocks=[details]
-    payload={"chat_id":CHANNEL_ID,"rich_message":{"blocks":blocks},"disable_notification":False}
-    token=bot.token
-    url=f"https://api.telegram.org/bot{token}/sendRichMessage"
+    compact = []
+    for idx in (title_idx, notice_idx, lead_idx):
+        if idx is not None and full_blocks[idx] not in compact:
+            compact.append(full_blocks[idx])
+
+    if not compact:
+        compact = full_blocks[:2]
+
+    key = secrets.token_hex(6)
+    CHANNEL_POST_STATES[key] = {
+        "full_blocks": full_blocks,
+        "compact_blocks": compact,
+        "chat_id": CHANNEL_ID,
+    }
+
+    def button(label: str, action: str):
+        return {
+            "type": "buttons",
+            "align": "center",
+            "buttons": [{
+                "text": label,
+                "style": "primary",
+                "callback_data": f"channel:{action}:{key}",
+            }],
+        }
+
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "rich_message": {
+            "blocks": compact + [button("Розгорнути", "expand")]
+        },
+        "disable_notification": False,
+    }
+    token = bot.token
+    url = f"https://api.telegram.org/bot{token}/sendRichMessage"
     async with httpx.AsyncClient(timeout=90) as client_http:
-        response=await client_http.post(url,json=payload)
+        response = await client_http.post(url, json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"Telegram sendRichMessage failed: {response.text}")
+        data = response.json()
+        result = data.get("result") or {}
+        if isinstance(result, dict) and result.get("message_id"):
+            CHANNEL_POST_STATES[key]["message_id"] = result["message_id"]
 
 
 async def create_and_send_for_approval(bot, chat_id: int):
@@ -792,6 +824,41 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # Public channel post controls. These must be handled before the admin-only
+    # draft controls because any subscriber may press the channel button.
+    if query.data and query.data.startswith("channel:"):
+        try:
+            _, action, key = query.data.split(":", 2)
+            state = CHANNEL_POST_STATES.get(key)
+            if not state or not query.message:
+                return
+            blocks = state["full_blocks"] if action == "expand" else state["compact_blocks"]
+            label = "Згорнути" if action == "expand" else "Розгорнути"
+            blocks = blocks + [{
+                "type": "buttons",
+                "align": "center",
+                "buttons": [{
+                    "text": label,
+                    "style": "primary",
+                    "callback_data": f"channel:{'collapse' if action == 'expand' else 'expand'}:{key}",
+                }],
+            }]
+            token = context.bot.token
+            url = f"https://api.telegram.org/bot{token}/editMessageText"
+            payload = {
+                "chat_id": query.message.chat.id,
+                "message_id": query.message.message_id,
+                "rich_message": {"blocks": blocks},
+            }
+            async with httpx.AsyncClient(timeout=90) as client_http:
+                response = await client_http.post(url, json=payload)
+                if response.status_code != 200:
+                    logger.warning("Channel post edit failed: %s", response.text)
+        except Exception:
+            logger.exception("Channel expand/collapse failed")
+        return
+
     if not query.from_user or query.from_user.id != ADMIN_ID:
         return
     user_id = query.from_user.id
