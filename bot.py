@@ -25,11 +25,25 @@ POST_MINUTE = int(os.getenv("POST_MINUTE", "0"))
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
+# Telegram Rich Messages allow up to 32,768 UTF-8 characters. Keep published
+# articles at no more than 75% of that ceiling, with a safety margin for links
+# and formatting overhead.
+MAX_ARTICLE_CHARS = 24500
+TARGET_ARTICLE_CHARS = 22000
+
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = 'Ти — головний редактор і аналітик українського медіа «Технократ».\nТвоє завдання — не переказувати новини, а пояснювати, як змінюється світ, чому це відбувається і до чого це може привести в майбутньому.\n\nГоловний принцип\n\nШукай не найгучніші новини, а найважливіші зміни.\n\nГоловне питання:\n«Що ця подія може змінити в майбутньому?»\n\nПеревагу надавай подіям, які можуть впливати на майбутнє людства, науку, штучний інтелект (ШІ), технології, космос, енергетику, клімат, демографію, суспільні відносини, відносини між чоловіками та жінками, економіку та геополітичний порядок.\n\nОсобливо звертай увагу на невеликі сьогодні події, які можуть стати великими тенденціями завтра.\n\nВійна\n\nРосійсько-українська війна — лише одна з тем.\n\nНе включай її до кожного огляду автоматично. Пиши про неї лише тоді, коли відбулися суттєві стратегічні зміни, які можуть вплинути на Україну, Європу, міжнародний порядок або майбутнє війни.\n\nНе дозволяй війні витісняти важливіші зміни у науці, технологіях, ШІ, космосі, суспільстві чи інших сферах.\n\nВідбір\n\nПроаналізуй приблизно останні 7 днів і вибери від 1 до 3 найважливіших тем.\n\nНе створюй додаткові теми штучно.\n\nОцінюй їх за:\n- впливом на майбутнє;\n- масштабом можливих змін;\n- довгостроковими наслідками;\n- значенням для людства;\n- значенням для України.\n\nДжерела\n\nПроводь достатній вебпошук.\n\nВикористовуй першоджерела, офіційні документи, наукові публікації, статистику, авторитетні українські та міжнародні медіа, а також дописи відомих людей у соціальних мережах (тільки якщо ці люди можуть бути першоджерелами цих новин або подій).\n\nВикористовуй і українські, і міжнародні джерела, оцінюючи їх за якістю, а не за країною походження.\n\nДля важливих або суперечливих тверджень використовуй декілька незалежних джерел.\n\nНе вигадуй фактів, статистики, цитат або джерел.\n\nАналіз\n\nДля кожної теми поясни:\nЩо сталося?\nЧому це сталося?\nЩо змінилося?\nЧому це важливо?\nХто отримує перевагу?\nЯкі можливі наслідки?\nЩо це означає для України та світу?\nЧи може це стати початком більшої тенденції?\n\nЧітко відокремлюй факти, власний аналіз та прогноз.\n\nПрогнози подавай як можливі сценарії, а не як встановлені факти.\n\nСтиль\n\nПиши українською.\n\nСтиль — живий, інтелектуальний, зрозумілий, аргументований і прямий.\n\nМова повинна бути живою та природною, без шаблонності.\nУ доречних місцях допускається гостра, різка й провокативна подача, якщо вона підсилює аргумент і випливає з аналізу.\nГострота не повинна перетворюватися на образи, дешеву сенсаційність або штучну драматизацію.\n\nНе використовуй зайвий пафос, канцелярит, журналістські кліше та повтори.\n\nНе створюй штучного «балансу думок», якщо факти дозволяють зробити однозначний висновок.\n\nНе перетворюй матеріал на стрічку новин.\n\nНе використовуй як заголовок або назву розділу формулювання «Аналіз Технократа» чи подібні саморекламні назви. Стаття сама є аналітичним матеріалом «Технократа».\n\nСтруктура\n\nМатеріал повинен містити:\nЗаголовок\nКороткий вступ\nГоловне за тиждень\nАналіз вибраних тем\nЩо це означає для України — якщо тема має суттєве значення для України.\nЩо буде далі — якщо прогноз справді має цінність.\nВисновок\nДжерела\n\nВикористовуй таблиці, графіки та інші візуальні матеріали лише тоді, коли вони реально допомагають зрозуміти тему.\n\nНе збільшуй матеріал штучно.\n\nКраще одна справді важлива тема з глибоким аналізом, ніж три поверхневі новини.\n\nФінальне правило\n\nНе пиши про те, що було важливим цього тижня. Пиши про те, що сталося цього тижня і може виявитися важливим для майбутнього.\n\nНе шукай новини про майбутнє. Шукай майбутнє в новинах.'
+
+ARTICLE_LENGTH_RULE = f'''
+
+Обсяг матеріалу
+
+Текст для Telegram має бути стислим. Орієнтуйся на 20 000–22 000 знаків і в жодному разі не перевищуй {TARGET_ARTICLE_CHARS} знаків без нагальної потреби. Це приблизно 67% від технічної межі Rich Message Telegram і залишає запас для форматування та посилань. Не розтягуй статтю заради повноти: скорочуй повтори, другорядні деталі та поверхневі пояснення. Усі важливі джерела та їхні посилання обов'язково зберігай.
+'''
+
 
 
 def authorized(update: Update) -> bool:
@@ -43,7 +57,7 @@ async def generate_review(editor_note: str = "") -> str:
     response = await client.responses.create(
         model=MODEL,
         tools=[{"type": "web_search"}],
-        input=SYSTEM_PROMPT + "\n\n" + instruction,
+        input=SYSTEM_PROMPT + ARTICLE_LENGTH_RULE + "\n\n" + instruction,
     )
     return response.output_text.strip()
 
@@ -110,7 +124,7 @@ async def generate_answer(question: str) -> str:
     response = await client.responses.create(
         model=MODEL,
         tools=[{"type": "web_search"}],
-        input=SYSTEM_PROMPT + "\n\n" + instruction,
+        input=SYSTEM_PROMPT + ARTICLE_LENGTH_RULE + "\n\n" + instruction,
     )
     return response.output_text.strip()
 
@@ -135,7 +149,7 @@ async def revise_draft(draft: str, instruction: str) -> str:
     response = await client.responses.create(
         model=MODEL,
         tools=[{"type": "web_search"}],
-        input=SYSTEM_PROMPT + "\n\n" + prompt,
+        input=SYSTEM_PROMPT + ARTICLE_LENGTH_RULE + "\n\n" + prompt,
     )
     return response.output_text.strip()
 
@@ -239,7 +253,7 @@ def markdown_to_rich_html(text: str, collapse: bool = False) -> str:
                 return token
 
             # Markdown links: support URLs containing balanced parentheses too.
-            link_re = re.compile(r"\[([^\]]+)\]\((https?://(?:[^()\s]|\([^()]*\))+?)\)")
+            link_re = re.compile(r"\[([^\]]+)\]\((https?://(?:[^\s()]+|\([^\s()]*\))+?)\)")
             def link_sub(m):
                 label = _html.escape(m.group(1), quote=False)
                 href = _html.escape(m.group(2), quote=True)
@@ -594,7 +608,7 @@ async def send_plain_fallback(bot, chat_id: str | int, text: str, reply_markup=N
 async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=None, collapse: bool = False):
     """Send text and return IDs of all messages belonging to this preview."""
     sent_ids = []
-    if len(text) <= 30000:
+    if len(text) <= MAX_ARTICLE_CHARS:
         try:
             mid = await send_rich_message(bot, chat_id, text, reply_markup, collapse=collapse)
         except Exception:
@@ -605,11 +619,11 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
         return sent_ids
 
     chunks, remaining = [], text
-    while len(remaining) > 30000:
-        cut = remaining.rfind("</p>", 0, 30000)
-        if cut < 1000: cut = remaining.rfind("</div>", 0, 30000)
-        if cut < 1000: cut = remaining.rfind("\n", 0, 30000)
-        if cut < 1000: cut = 30000
+    while len(remaining) > MAX_ARTICLE_CHARS:
+        cut = remaining.rfind("</p>", 0, MAX_ARTICLE_CHARS)
+        if cut < 1000: cut = remaining.rfind("</div>", 0, MAX_ARTICLE_CHARS)
+        if cut < 1000: cut = remaining.rfind("\n", 0, MAX_ARTICLE_CHARS)
+        if cut < 1000: cut = MAX_ARTICLE_CHARS
         cut = cut + 4 if remaining[cut:cut+4] == "</p>" else cut
         chunks.append(remaining[:cut])
         remaining = remaining[cut:].lstrip()
@@ -629,6 +643,70 @@ async def send_long_message(bot, chat_id: str | int, text: str, reply_markup=Non
 
 
 
+async def keep_article_within_budget(text: str) -> str:
+    """Condense generated/editorial text when it exceeds the publishing budget.
+
+    This is deliberately done before Rich Message conversion so source links are
+    preserved as Markdown links instead of being lost while splitting/truncating
+    the rendered message.
+    """
+    if len(text) <= MAX_ARTICLE_CHARS:
+        return text
+
+    prompt = f"""Скороти цей матеріал для публікації в Telegram.
+
+Жорстка вимога: результат має бути не довшим за {TARGET_ARTICLE_CHARS} знаків.
+Збережи головну думку, ключові факти, висновки та структуру.
+Прибери повтори, другорядні подробиці, зайві вступи та словесний шум.
+
+КРИТИЧНО ВАЖЛИВО:
+- збережи ВСІ важливі джерела з кінцевого розділу «Джерела»;
+- не видаляй і не змінюй URL у Markdown-посиланнях виду [назва](https://...);
+- не замінюй посилання порожніми дужками;
+- не вигадуй нових джерел;
+- поверни повний готовий текст статті, без пояснення того, що ти скоротила.
+
+Текст:
+{text}
+"""
+    try:
+        response = await client.responses.create(
+            model=MODEL,
+            tools=[],
+            input=prompt,
+        )
+        shortened = response.output_text.strip()
+        if shortened and len(shortened) <= MAX_ARTICLE_CHARS:
+            return shortened
+        # If the model still exceeds the hard limit, keep the source section and
+        # trim the body at a paragraph boundary rather than cutting a URL in half.
+        return safe_trim_article(shortened or text, MAX_ARTICLE_CHARS)
+    except Exception:
+        logger.exception("Article condensation failed; applying safe local trim")
+        return safe_trim_article(text, MAX_ARTICLE_CHARS)
+
+
+def safe_trim_article(text: str, limit: int = MAX_ARTICLE_CHARS) -> str:
+    """Trim at paragraph boundaries while preserving the Sources section."""
+    if len(text) <= limit:
+        return text
+    import re
+    m = re.search(r'(?im)^#{1,6}\s*Джерела\s*$', text)
+    sources = text[m.start():] if m else ""
+    body = text[:m.start()] if m else text
+    if sources and len(sources) < limit:
+        budget = limit - len(sources) - 2
+        cut = body[:budget]
+        # Do not cut in the middle of a Markdown link.
+        cut = cut.rsplit("\n\n", 1)[0]
+        if not cut:
+            cut = body[:budget].rsplit("\n", 1)[0]
+        return cut.rstrip() + "\n\n" + sources.lstrip()
+    # Last-resort paragraph boundary.
+    cut = text[:limit]
+    return cut.rsplit("\n\n", 1)[0].rstrip()
+
+
 async def deliver_to_group(bot, text: str):
     """Publish an approved article with exactly one custom Rich Message button.
 
@@ -641,6 +719,11 @@ async def deliver_to_group(bot, text: str):
     """
     import re
     import secrets
+
+    # Keep every published Rich Message comfortably below Telegram's 32,768-char
+    # limit. This also prevents the final source links from being pushed out by
+    # formatting overhead.
+    text = await keep_article_within_budget(text)
 
     disclaimer_token = "[[AI_DISCLAIMER]]"
     if text and disclaimer_token not in text:
