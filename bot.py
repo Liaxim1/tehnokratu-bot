@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import os
-from datetime import time
+import re
 import json
 import html as html_lib
+from pathlib import Path
 
 import httpx
 from zoneinfo import ZoneInfo
@@ -13,6 +14,9 @@ from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 
 load_dotenv()
 
@@ -20,10 +24,12 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-POST_HOUR = int(os.getenv("POST_HOUR", "10"))
-POST_MINUTE = int(os.getenv("POST_MINUTE", "0"))
-TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Kyiv"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook")
+SCHEDULE_SECRET = os.getenv("SCHEDULE_SECRET", "")
+STATE_DIR = Path(os.getenv("STATE_DIR", "/data"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / "state.json"
 
 # Telegram Rich Messages allow up to 32,768 UTF-8 characters. Keep published
 # articles at no more than 75% of that ceiling, with a safety margin for links
@@ -46,6 +52,23 @@ ARTICLE_LENGTH_RULE = f'''
 
 
 
+def set_session(user_id: int, **values):
+    session = USER_SESSIONS.setdefault(user_id, {})
+    session.update(values)
+    save_state()
+
+def clear_session(user_id: int, *keys):
+    session = USER_SESSIONS.get(user_id, {})
+    for key in keys:
+        session.pop(key, None)
+    if not session:
+        USER_SESSIONS.pop(user_id, None)
+    save_state()
+
+def get_session(user_id: int, key: str, default=None):
+    return USER_SESSIONS.get(user_id, {}).get(key, default)
+
+
 def authorized(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
@@ -64,26 +87,35 @@ async def generate_review(editor_note: str = "") -> str:
 
 PENDING_DRAFT: dict[int, str] = {}
 DRAFT_MESSAGE_IDS: dict[int, list[int]] = {}  # current preview messages per admin
-# Channel posts with a custom expand/collapse button. State is intentionally in-memory;
-# the button is relevant to the currently running bot instance.
+# Channel post controls need only live callback state. The article itself is persisted
+# in the channel message, while this mapping is recreated after each deployment.
 CHANNEL_POST_STATES: dict[str, dict] = {}
-FAVORITES_FILE = os.getenv("FAVORITES_FILE", "favorites.json")
 FAVORITES: dict[int, list[dict[str, str]]] = {}
+USER_SESSIONS: dict[int, dict] = {}
 
-def load_favorites():
-    global FAVORITES
+def load_state():
+    global PENDING_DRAFT, FAVORITES, CHANNEL_POST_STATES, USER_SESSIONS
     try:
-        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        FAVORITES = {int(k): v for k, v in raw.items()}
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        PENDING_DRAFT = {int(k): v for k, v in raw.get("pending_draft", {}).items()}
+        FAVORITES = {int(k): v for k, v in raw.get("favorites", {}).items()}
+        CHANNEL_POST_STATES = raw.get("channel_post_states", {})
+        USER_SESSIONS = {int(k): v for k, v in raw.get("user_sessions", {}).items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        PENDING_DRAFT = {}
         FAVORITES = {}
+        CHANNEL_POST_STATES = {}
+        USER_SESSIONS = {}
 
-def save_favorites():
-    tmp = FAVORITES_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(FAVORITES, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, FAVORITES_FILE)
+def save_state():
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "pending_draft": {str(k): v for k, v in PENDING_DRAFT.items()},
+        "favorites": {str(k): v for k, v in FAVORITES.items()},
+        "channel_post_states": CHANNEL_POST_STATES,
+        "user_sessions": {str(k): v for k, v in USER_SESSIONS.items()},
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
 
 def add_favorite(user_id: int, text: str) -> int:
     items = FAVORITES.setdefault(user_id, [])
@@ -96,16 +128,16 @@ def add_favorite(user_id: int, text: str) -> int:
         "text": text,
         "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()
     })
-    save_favorites()
+    save_state()
     return len(items)
 
 def remove_favorite(user_id: int, index: int):
     items = FAVORITES.get(user_id, [])
     if 1 <= index <= len(items):
         items.pop(index - 1)
-        save_favorites()
+        save_state()
 
-load_favorites()
+load_state()
 
 
 
@@ -794,6 +826,12 @@ async def deliver_to_group(bot, text: str):
         result = data.get("result") or {}
         if isinstance(result, dict) and result.get("message_id"):
             CHANNEL_POST_STATES[key]["message_id"] = result["message_id"]
+        # Keep only recent channel controls so the state file stays small.
+        if len(CHANNEL_POST_STATES) > 30:
+            oldest = list(CHANNEL_POST_STATES.keys())[:-30]
+            for old_key in oldest:
+                CHANNEL_POST_STATES.pop(old_key, None)
+        save_state()
 
 
 async def create_and_send_for_approval(bot, chat_id: int):
@@ -801,6 +839,7 @@ async def create_and_send_for_approval(bot, chat_id: int):
     try:
         post = await generate_review()
         PENDING_DRAFT[chat_id] = post
+        save_state()
         await send_long_message(bot, str(chat_id), post, approval_keyboard())
         await bot.send_message(chat_id=chat_id, text="Перевірте статтю. Можна підтвердити, відхилити або внести правки.")
     except Exception as exc:
@@ -823,10 +862,10 @@ async def preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def done_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    if not context.user_data.get("manual_edit"):
+    if not get_session(update.effective_user.id, "manual_edit", False):
         await update.message.reply_text("Зараз немає режиму ручного введення статті.")
         return
-    parts = context.user_data.get("manual_parts", [])
+    parts = get_session(update.effective_user.id, "manual_parts", [])
     if not parts:
         await update.message.reply_text("Ви ще не надіслали текст.")
         return
@@ -834,8 +873,8 @@ async def done_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft = "\n\n".join(parts).strip()
     user_id = update.effective_user.id
     PENDING_DRAFT[user_id] = draft
-    context.user_data.pop("manual_edit", None)
-    context.user_data.pop("manual_parts", None)
+    save_state()
+    clear_session(user_id, "manual_edit", "manual_parts")
 
     await update.message.reply_text("Готово. Ваш текст встановлено як нову чернетку. Перевірте його:")
     await show_draft(update, context, draft, collapsed=True)
@@ -867,7 +906,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in PENDING_DRAFT:
         await update.message.reply_text("Спочатку створіть або відкрийте чернетку.")
         return
-    context.user_data["admin_insert_mode"] = True
+    set_session(update.effective_user.id, admin_insert_mode=True)
     await update.message.reply_text(
         "Надішліть текст вашої думки. Я збережу його як текст Адміністратора. "
         "Щоб вставити його в потрібне місце, найнадійніше використовувати [[ADMIN]]...[[/ADMIN]] "
@@ -880,10 +919,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
     existed = PENDING_DRAFT.pop(user_id, None) is not None
-    context.user_data.pop("revision_edit", None)
-    context.user_data.pop("manual_edit", None)
-    context.user_data.pop("manual_parts", None)
-    context.user_data.pop("awaiting_question", None)
+    save_state()
+    clear_session(user_id, "revision_edit")
+    clear_session(user_id, "manual_edit", "manual_parts")
+    clear_session(user_id, "awaiting_question")
     if existed:
         await update.message.reply_text("Поточну чернетку скасовано. Її не буде опубліковано.")
     else:
@@ -896,7 +935,7 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     question = " ".join(context.args).strip()
     if not question:
-        context.user_data["awaiting_question"] = True
+        set_session(update.effective_user.id, awaiting_question=True)
         await update.message.reply_text(
             "Напишіть питання одним повідомленням. Я проведу вебпошук і зроблю окремий аналіз."
         )
@@ -1013,6 +1052,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             fav_text = items[idx - 1].get("text", "")
             PENDING_DRAFT[user_id] = fav_text
+            save_state()
             await show_draft(query, context, fav_text, collapsed=True)
         except (ValueError, IndexError):
             await query.message.reply_text("Не вдалося відкрити цей матеріал.")
@@ -1023,9 +1063,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await deliver_to_group(context.bot, draft)
             await clear_draft_messages(context.bot, user_id)
             PENDING_DRAFT.pop(user_id, None)
-            context.user_data.pop("revision_edit", None)
-            context.user_data.pop("manual_edit", None)
-            context.user_data.pop("manual_parts", None)
+            save_state()
+            clear_session(user_id, "revision_edit")
+            clear_session(user_id, "manual_edit")
+            clear_session(user_id, "manual_parts")
             await query.message.reply_text("Готово. Матеріал підтверджено та відправлено в групу.")
         except Exception as exc:
             logger.exception("Publication failed")
@@ -1033,18 +1074,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "revise":
-        context.user_data["revision_edit"] = True
-        context.user_data.pop("manual_edit", None)
-        context.user_data.pop("manual_parts", None)
+        set_session(update.effective_user.id, revision_edit=True)
+        clear_session(user_id, "manual_edit")
+        clear_session(user_id, "manual_parts")
         await query.message.reply_text(
             "Напишіть одним повідомленням, що саме потрібно змінити. Я перероблю поточну версію. Власну думку, яку треба дослівно вставити, можна позначити [[ADMIN]]...[[/ADMIN]]."
         )
         return
 
     if query.data == "edit":
-        context.user_data["manual_edit"] = True
-        context.user_data["manual_parts"] = []
-        context.user_data.pop("revision_edit", None)
+        set_session(update.effective_user.id, manual_edit=True)
+        set_session(update.effective_user.id, manual_parts=[])
+        clear_session(user_id, "revision_edit")
         await query.message.reply_text(
             "Надішліть свій готовий текст замість цієї чернетки. "
             "Можна одним повідомленням або кількома частинами. Після останньої частини надішліть /done."
@@ -1061,17 +1102,18 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    if context.user_data.get("admin_insert_mode"):
+    if get_session(update.effective_user.id, "admin_insert_mode", False):
         admin_text = update.message.text.strip()
         if not admin_text:
             return
         draft = PENDING_DRAFT.get(user_id)
         if not draft:
-            context.user_data.pop("admin_insert_mode", None)
+            clear_session(user_id, "admin_insert_mode")
             await update.message.reply_text("Поточна чернетка вже відсутня.")
             return
-        context.user_data.pop("admin_insert_mode", None)
+        clear_session(user_id, "admin_insert_mode")
         PENDING_DRAFT[user_id] = draft + "\n\n[[ADMIN]]" + admin_text + "[[/ADMIN]]"
+        save_state()
         await update.message.reply_text(
             "Думку додано до чернетки. Для вставлення її в інше місце скористайтеся «Ввести свій текст» "
             "і маркерами [[ADMIN]]...[[/ADMIN]]."
@@ -1079,13 +1121,14 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_draft(update, context, PENDING_DRAFT[user_id], collapsed=True)
         return
 
-    if context.user_data.get("awaiting_question"):
+    if get_session(update.effective_user.id, "awaiting_question", False):
         question = update.message.text.strip()
-        context.user_data.pop("awaiting_question", None)
+        clear_session(user_id, "awaiting_question")
         await update.message.reply_text("Шукаю інформацію та готую відповідь…")
         try:
             answer = await generate_answer(question)
             PENDING_DRAFT[user_id] = answer
+            save_state()
             await send_long_message(
                 context.bot,
                 str(user_id),
@@ -1101,21 +1144,22 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Помилка: {type(exc).__name__}: {exc}")
         return
 
-    if context.user_data.get("revision_edit"):
+    if get_session(update.effective_user.id, "revision_edit", False):
         instruction = update.message.text.strip()
         if not instruction:
             return
         draft = PENDING_DRAFT.get(user_id)
         if not draft:
-            context.user_data.pop("revision_edit", None)
+            clear_session(user_id, "revision_edit")
             await update.message.reply_text("Поточна чернетка вже відсутня. Створіть новий аналіз через /ask.")
             return
 
-        context.user_data.pop("revision_edit", None)
+        clear_session(user_id, "revision_edit")
         await update.message.reply_text("Вношу правки та перевіряю фактичні зміни…")
         try:
             revised = await revise_draft(draft, instruction)
             PENDING_DRAFT[user_id] = revised
+            save_state()
             await send_long_message(
                 context.bot,
                 str(user_id),
@@ -1127,14 +1171,15 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Помилка під час редагування: {type(exc).__name__}: {exc}")
         return
 
-    if not context.user_data.get("manual_edit"):
+    if not get_session(update.effective_user.id, "manual_edit", False):
         return
 
     part = update.message.text
     if not part.strip():
         return
-    context.user_data.setdefault("manual_parts", []).append(part)
-    count = len(context.user_data["manual_parts"])
+    get_session(user_id, "manual_parts", []).append(part)
+    save_state()
+    count = len(get_session(update.effective_user.id, "manual_parts", []))
     await update.message.reply_text(
         f"Отримала частину {count}. Надішліть наступну частину або /done, якщо це був останній фрагмент."
     )
@@ -1142,35 +1187,84 @@ async def text_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
+
+async def process_update_background(update: Update):
     try:
-        await create_and_send_for_approval(context.bot, ADMIN_ID)
-        logger.info("Scheduled weekly draft generated for approval")
+        await application.process_update(update)
     except Exception:
-        logger.exception("Scheduled draft failed")
+        logger.exception("Update processing failed")
+
+
+async def generate_weekly_background():
+    try:
+        await create_and_send_for_approval(application.bot, ADMIN_ID)
+        logger.info("Weekly draft generated for approval")
+    except Exception:
+        logger.exception("Weekly draft generation failed")
+
+
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(CommandHandler("post", make_post))
+application.add_handler(CommandHandler("preview", preview))
+application.add_handler(CommandHandler("ask", ask_cmd))
+application.add_handler(CommandHandler("cancel", cancel_cmd))
+application.add_handler(CommandHandler("favorites", favorites_cmd))
+application.add_handler(CommandHandler("admin", admin_cmd))
+application.add_handler(CommandHandler("done", done_edit))
+application.add_handler(CallbackQueryHandler(callbacks))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
+
+web = FastAPI(title="Tehnokratu Bot")
+
+@web.get("/")
+async def root():
+    return {"status": "ok", "service": "tehnokratu-bot"}
+
+@web.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@web.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    payload = await request.json()
+    update = Update.de_json(payload, application.bot)
+    asyncio.create_task(process_update_background(update))
+    return JSONResponse({"ok": True})
+
+@web.post("/internal/weekly")
+async def internal_weekly(x_schedule_secret: str | None = Header(default=None)):
+    if not SCHEDULE_SECRET or x_schedule_secret != SCHEDULE_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    asyncio.create_task(generate_weekly_background())
+    return JSONResponse({"ok": True, "started": True}, status_code=202)
+
+@web.on_event("startup")
+async def startup():
+    await application.initialize()
+    await application.start()
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    if public_domain:
+        webhook_url = f"https://{public_domain}{WEBHOOK_PATH}"
+        await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        logger.info("Telegram webhook set to %s", webhook_url)
+    else:
+        logger.warning("RAILWAY_PUBLIC_DOMAIN is not set; Telegram webhook was not configured")
+
+@web.on_event("shutdown")
+async def shutdown():
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        logger.exception("Could not delete Telegram webhook")
+    await application.stop()
+    await application.shutdown()
+
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("post", make_post))
-    app.add_handler(CommandHandler("preview", preview))
-    app.add_handler(CommandHandler("ask", ask_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-    app.add_handler(CommandHandler("favorites", favorites_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("done", done_edit))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
-
-    app.job_queue.run_daily(
-        scheduled_post,
-        time(hour=POST_HOUR, minute=POST_MINUTE, tzinfo=TZ),
-        days=(6,),
-        name="weekly_world_review",
-    )
-    logger.info("Bot started; weekly draft on Saturday at %02d:%02d %s", POST_HOUR, POST_MINUTE, TZ.key)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(web, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
