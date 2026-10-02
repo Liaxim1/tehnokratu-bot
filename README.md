@@ -67,6 +67,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 python bot.py
+Оновлено для Railway Free.
 ```
 
 Для локального запуску Telegram webhook потребує доступної з інтернету HTTPS-адреси. На Railway це налаштовується автоматично через `RAILWAY_PUBLIC_DOMAIN`.
