@@ -682,7 +682,9 @@ async def keep_article_within_budget(text: str) -> str:
     preserved as Markdown links instead of being lost while splitting/truncating
     the rendered message.
     """
-    if len(text) <= MAX_ARTICLE_CHARS:
+    # Enforce the editorial target, not merely Telegram's technical ceiling.
+    # This guarantees that weekly drafts fit comfortably into ONE Rich Message.
+    if len(text) <= TARGET_ARTICLE_CHARS:
         return text
 
     prompt = f"""Скороти цей матеріал для публікації в Telegram.
@@ -708,14 +710,14 @@ async def keep_article_within_budget(text: str) -> str:
             input=prompt,
         )
         shortened = response.output_text.strip()
-        if shortened and len(shortened) <= MAX_ARTICLE_CHARS:
+        if shortened and len(shortened) <= TARGET_ARTICLE_CHARS:
             return shortened
-        # If the model still exceeds the hard limit, keep the source section and
-        # trim the body at a paragraph boundary rather than cutting a URL in half.
-        return safe_trim_article(shortened or text, MAX_ARTICLE_CHARS)
+        # If the model still exceeds the editorial target, keep the source section
+        # and trim the body at a paragraph boundary rather than splitting the draft.
+        return safe_trim_article(shortened or text, TARGET_ARTICLE_CHARS)
     except Exception:
         logger.exception("Article condensation failed; applying safe local trim")
-        return safe_trim_article(text, MAX_ARTICLE_CHARS)
+        return safe_trim_article(text, TARGET_ARTICLE_CHARS)
 
 
 def safe_trim_article(text: str, limit: int = MAX_ARTICLE_CHARS) -> str:
@@ -838,6 +840,8 @@ async def create_and_send_for_approval(bot, chat_id: int):
     await bot.send_message(chat_id=chat_id, text="Готую щотижневу статтю. Це може зайняти кілька хвилин…")
     try:
         post = await generate_review()
+        # The weekly draft must always fit in one Telegram Rich Message.
+        post = await keep_article_within_budget(post)
         PENDING_DRAFT[chat_id] = post
         save_state()
         await send_long_message(bot, str(chat_id), post, approval_keyboard())
