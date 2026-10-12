@@ -1277,7 +1277,36 @@ application.add_handler(CommandHandler("done", done_edit))
 application.add_handler(CallbackQueryHandler(callbacks))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_edit))
 
-web = FastAPI(title="Tehnokratu Bot")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await application.initialize()
+    await application.start()
+
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    if public_domain:
+        webhook_url = f"https://{public_domain}{WEBHOOK_PATH}"
+        await application.bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        logger.info("Telegram webhook set to %s", webhook_url)
+    else:
+        logger.warning(
+            "RAILWAY_PUBLIC_DOMAIN is not set; Telegram webhook was not configured"
+        )
+
+    try:
+        yield
+    finally:
+        # Do NOT delete the webhook here. Railway may stop/sleep the container;
+        # Telegram must keep the webhook so a later update can wake the service.
+        await application.stop()
+        await application.shutdown()
+
+
+web = FastAPI(title="Tehnokratu Bot", lifespan=lifespan)
 
 @web.get("/")
 async def root():
@@ -1291,7 +1320,19 @@ async def health():
 async def telegram_webhook(request: Request):
     payload = await request.json()
     update = Update.de_json(payload, application.bot)
-    asyncio.create_task(process_update_background(update))
+
+    # Process the Telegram update before returning HTTP 200.
+    # If processing fails, return 500 so Telegram can retry delivery instead
+    # of considering the update successfully handled.
+    try:
+        await application.process_update(update)
+    except Exception:
+        logger.exception("Update processing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Telegram update processing failed",
+        )
+
     return JSONResponse({"ok": True})
 
 @web.post("/internal/weekly")
@@ -1300,28 +1341,6 @@ async def internal_weekly(x_schedule_secret: str | None = Header(default=None)):
         raise HTTPException(status_code=403, detail="Forbidden")
     asyncio.create_task(generate_weekly_background())
     return JSONResponse({"ok": True, "started": True}, status_code=202)
-
-@web.on_event("startup")
-async def startup():
-    await application.initialize()
-    await application.start()
-    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-    if public_domain:
-        webhook_url = f"https://{public_domain}{WEBHOOK_PATH}"
-        await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-        logger.info("Telegram webhook set to %s", webhook_url)
-    else:
-        logger.warning("RAILWAY_PUBLIC_DOMAIN is not set; Telegram webhook was not configured")
-
-@web.on_event("shutdown")
-async def shutdown():
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        logger.exception("Could not delete Telegram webhook")
-    await application.stop()
-    await application.shutdown()
-
 
 def main():
     port = int(os.getenv("PORT", "8080"))
